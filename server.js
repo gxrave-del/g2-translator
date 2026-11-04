@@ -4,7 +4,7 @@ import { GoogleGenAI } from '@google/genai';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const MODEL = 'gemini-3.8-flash';
+const MODEL = 'gemini-2.5-flash';
 const LINE_WIDTH = 28;                    // 글래스 한 줄 글자 수 (한글 기준, 실기기에서 조정)
 const DIVIDER = '-'.repeat(LINE_WIDTH);
 
@@ -79,4 +79,7 @@ app.post('/translate', async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
