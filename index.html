@@ -5,11 +5,12 @@ HTML
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>G2 Translator Client</title>
+  <!-- Even Hub SDK 브리지 (안경 통신용) -->
   <script src="https://cdn.jsdelivr.net/npm/@evenrealities/even_hub_sdk@latest/dist/evenhub.min.js"></script>
   <style>
     body {
       background-color: #0d1117;
-      color: #00ff66; /* 안경 HUD 단색 디스플레이 느낌의 녹색 */
+      color: #00ff66;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
       margin: 0;
       padding: 16px;
@@ -88,10 +89,10 @@ HTML
 
   <script>
     // ==========================================
-    // 1. 사용자 설정 (본인 주소 및 토큰으로 수정)
+    // 본인 Render 주소와 비밀번호를 적어주세요
     // ==========================================
-    const SERVER_URL = "https://g2-interpreter.onrender.com";
-    const APP_TOKEN = "Gx=jdh*078";
+    const SERVER_URL = "https://g2-interpreter.onrender.com/translate";
+    const APP_TOKEN = "my_g2_secret_1234";
 
     const micBtn = document.getElementById('micBtn');
     const statusText = document.getElementById('status');
@@ -100,14 +101,13 @@ HTML
     let recognition = null;
     let isListening = false;
 
-    // 브라우저 내장 음성인식(Web Speech API) 초기화
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
       outputDiv.textContent = "[오류] 이 브라우저는 음성인식을 지원하지 않습니다. Chrome 브라우저를 사용해 주세요.";
     } else {
       recognition = new SpeechRecognition();
-      recognition.continuous = false; // 한 문장 단위 인식
+      recognition.continuous = false;
       recognition.interimResults = false;
 
       recognition.onstart = () => {
@@ -145,7 +145,6 @@ HTML
       }
     }
 
-    // Render 서버로 텍스트 전달 후 스트리밍 출력
     async function sendToTranslateServer(text) {
       try {
         const response = await fetch(SERVER_URL, {
@@ -174,6 +173,15 @@ HTML
         }
 
         statusText.textContent = "완료";
+
+        // 번역 완료 후 Even G2 안경 화면으로 전송
+        if (window.EvenHub && window.EvenHub.bridge) {
+          window.EvenHub.bridge.textContainerUpgrade({
+            text: outputDiv.textContent,
+            fontSize: 'normal',
+            duration: 15000
+          });
+        }
       } catch (err) {
         outputDiv.textContent = `[통신 오류]\n${err.message}\n(토큰이나 서버 주소를 확인하세요)`;
         statusText.textContent = "실패";
