@@ -36,6 +36,14 @@ ${DIVIDER}
 `.trim();
 
 const app = express();
+// CORS 허용 설정 (GitHub Pages 통신 허용)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-app-token');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 app.use(express.json({ limit: '10kb' }));
 
 // 최소한의 접근 제어: 앱과 프록시가 공유하는 토큰
