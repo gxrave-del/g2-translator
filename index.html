@@ -129,12 +129,46 @@ HTML
       };
 
       recognition.onresult = async (event) => {
-        const spokenText = event.results[0][0].transcript;
-        outputDiv.textContent = `[감지된 말] ${spokenText}\n\nAI 번역 및 답변 생성 중...`;
-        statusText.textContent = "서버 통신 중...";
-        await sendToTranslateServer(spokenText);
-      };
+  const transcript = event.results[0][0].transcript;
+  console.log("인식된 음성 텍스트:", transcript);
+  
+  // 음성이 빈 문자열이면 중단
+  if (!transcript || transcript.trim() === "") {
+    statusDiv.innerText = "음성이 감지되지 않았습니다. 다시 말씀해 주세요.";
+    return;
+  }
+
+  statusDiv.innerText = `서버 통신 중... ("${transcript}")`;
+
+  try {
+    const response = await fetch(SERVER_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-app-token': APP_TOKEN
+      },
+      body: JSON.stringify({ text: transcript })
+    });
+
+    if (!response.ok) {
+      throw new Error(`서버 응답 오류 (상태코드: ${response.status})`);
     }
+
+    const data = await response.text();
+    console.log("서버 원본 응답:", data);
+
+    // 화면 상자에 출력
+    resultBox.innerText = data;
+    statusDiv.innerText = "통역 완료";
+
+    // Even G2 안경 렌즈로 텍스트 전송
+    if (typeof EvenHub !== 'undefined' && EvenHub.sendText) {
+      EvenHub.sendText(data);
+    }
+  } catch (err) {
+    statusDiv.innerText = "오류 발생: " + err.message;
+  }
+};
 
     function toggleRecognition() {
       if (!recognition) return;
