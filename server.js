@@ -28,19 +28,11 @@ const SYSTEM_PROMPT = `당신은 Even Realities G2 스마트 안경 전용 동�
 2. 거절/대안: (원어) / (한글발음) / (한국어 뜻)
 3. 역질문: (원어) / (한글발음) / (한국어 뜻)`;
 
-// 순차적으로 시도할 모델 후보군
-const CANDIDATE_MODELS = [
-  'gemini-2.0-flash',
-  'gemini-1.5-flash-latest',
-  'gemini-pro',
-  'gemini-1.0-pro'
-];
-
 app.post('/translate', async (req, res) => {
   try {
     const token = req.headers['x-app-token'];
     if (token && token !== APP_TOKEN) {
-      return res.status(401).send('토큰 인증 실패');
+      return res.status(401).send('토큰 인증 실패: APP_TOKEN 불일치');
     }
 
     const { text } = req.body;
@@ -49,70 +41,41 @@ app.post('/translate', async (req, res) => {
     }
 
     if (!apiKey) {
-      return res.status(500).send('서버에 GEMINI_API_KEY 환경변수가 없습니다.');
+      return res.status(500).send('서버에 GEMINI_API_KEY가 없습니다.');
     }
 
     console.log('[음성 수신]:', text);
 
-    let lastError = null;
-    let reply = null;
+    // 실제 확인된 공식 모델 gemini-2.5-flash 호출
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
-    // 지원되는 모델을 순차 탐색하여 성공 시 즉시 반환
-    for (const model of CANDIDATE_MODELS) {
-      try {
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-        
-        const apiRes = await fetch(apiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [
-              {
-                role: 'user',
-                parts: [{ text: `${SYSTEM_PROMPT}\n\n[입력된 음성]: ${text}` }]
-              }
-            ],
-            generationConfig: {
-              temperature: 0.3
-            }
-          })
-        });
-
-        const data = await apiRes.json();
-
-        if (apiRes.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
-          reply = data.candidates[0].content.parts[0].text;
-          console.log(`[통역 성공 - 사용된 모델: ${model}]`);
-          break;
-        } else {
-          lastError = data.error?.message || JSON.stringify(data);
-          console.warn(`[모델 ${model} 실패]:`, lastError);
+    const apiRes = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: `${SYSTEM_PROMPT}\n\n[입력된 음성]: ${text}` }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.3
         }
-      } catch (e) {
-        lastError = e.message;
-      }
+      })
+    });
+
+    const data = await apiRes.json();
+
+    if (!apiRes.ok) {
+      throw new Error(`Google API 호출 실패 (${apiRes.status}): ${data.error?.message || JSON.stringify(data)}`);
     }
 
-    if (reply) {
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      return res.status(200).send(reply);
-    }
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '번역 결과 텍스트를 찾지 못했습니다.';
+    console.log('[통역 생성 성공]:', reply);
 
-    // 모든 모델 실패 시, 현재 API 키에서 사용 가능한 모델 목록을 조회해 클라이언트에 표시
-    let availableModels = '조회 실패';
-    try {
-      const listRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-      const listData = await listRes.json();
-      if (listData.models) {
-        availableModels = listData.models.map(m => m.name.replace('models/', '')).join(', ');
-      } else {
-        availableModels = listData.error?.message || JSON.stringify(listData);
-      }
-    } catch (listErr) {
-      availableModels = listErr.message;
-    }
-
-    throw new Error(`모든 모델 호출 실패. (마지막 에러: ${lastError})\n\n[내 API 키로 사용 가능한 모델 목록]:\n${availableModels}`);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.status(200).send(reply);
 
   } catch (err) {
     console.error('[서버 통역 실패]:', err);
