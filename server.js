@@ -51,13 +51,13 @@ app.post('/translate', async (req, res) => {
     }
 
     if (!genAI) {
-      return res.status(500).send('서버에 GEMINI_API_KEY가 없습니다. Render 환경변수를 확인하세요.');
+      return res.status(500).send('서버에 GEMINI_API_KEY가 없습니다.');
     }
 
     console.log('[음성 수신]:', text);
 
-   const model = genAI.getGenerativeModel({
-  model: 'gemini-1.5-flash-latest',
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-1.5-flash-002',
       systemInstruction: SYSTEM_INSTRUCTION,
       generationConfig: {
         temperature: 0.3,
