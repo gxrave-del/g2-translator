@@ -46,8 +46,8 @@ app.post('/translate', async (req, res) => {
 
     console.log('[음성 수신]:', text);
 
-    // 구글 에러 메시지가 공식 지정한 gemini-3.8-flash 호출
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`;
+    // 안정적인 gemini-3.5-flash 호출
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`;
 
     const apiRes = await fetch(apiUrl, {
       method: 'POST',
