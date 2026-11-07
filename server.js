@@ -18,21 +18,29 @@ app.use(express.json());
 const apiKey = process.env.GEMINI_API_KEY;
 
 const SYSTEM_PROMPT = `당신은 Even Realities G2 스마트 안경 전용 동시통역 엔진입니다.
-상대방의 외국어 음성을 분석하여 아래 서식대로 즉시 답변을 작성하세요:
+상대방 외국어를 듣고 반드시 아래 양식으로만 간결하게 출력하세요:
 
 [한국어 번역]
-(정확하고 자연스러운 번역 문장)
+(자연스러운 번역 문장)
 
 [추천 회신 답변]
-1. 긍정: (현지어 문장) / (한글 발음) / (한국어 뜻)
-2. 거절/대안: (현지어 문장) / (한글 발음) / (한국어 뜻)
-3. 역질문: (현지어 문장) / (한글 발음) / (한국어 뜻)`;
+1. 긍정: (원어) / (한글발음) / (한국어 뜻)
+2. 거절/대안: (원어) / (한글발음) / (한국어 뜻)
+3. 역질문: (원어) / (한글발음) / (한국어 뜻)`;
+
+// 순차적으로 시도할 모델 후보군
+const CANDIDATE_MODELS = [
+  'gemini-2.0-flash',
+  'gemini-1.5-flash-latest',
+  'gemini-pro',
+  'gemini-1.0-pro'
+];
 
 app.post('/translate', async (req, res) => {
   try {
     const token = req.headers['x-app-token'];
     if (token && token !== APP_TOKEN) {
-      return res.status(401).send('토큰 인증 실패: APP_TOKEN 불일치');
+      return res.status(401).send('토큰 인증 실패');
     }
 
     const { text } = req.body;
@@ -46,38 +54,66 @@ app.post('/translate', async (req, res) => {
 
     console.log('[음성 수신]:', text);
 
-    // 구글 정식 v1 REST 엔드포인트 직접 호출 (라이브러리 404 원천 차단)
-    const apiUrl = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+    let lastError = null;
+    let reply = null;
 
-    const apiRes = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: `${SYSTEM_PROMPT}\n\n[입력된 음성]: ${text}` }
-            ]
-          }
-        ],
-        generationConfig: {
-          temperature: 0.3
+    // 지원되는 모델을 순차 탐색하여 성공 시 즉시 반환
+    for (const model of CANDIDATE_MODELS) {
+      try {
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        
+        const apiRes = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: `${SYSTEM_PROMPT}\n\n[입력된 음성]: ${text}` }]
+              }
+            ],
+            generationConfig: {
+              temperature: 0.3
+            }
+          })
+        });
+
+        const data = await apiRes.json();
+
+        if (apiRes.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
+          reply = data.candidates[0].content.parts[0].text;
+          console.log(`[통역 성공 - 사용된 모델: ${model}]`);
+          break;
+        } else {
+          lastError = data.error?.message || JSON.stringify(data);
+          console.warn(`[모델 ${model} 실패]:`, lastError);
         }
-      })
-    });
-
-    const data = await apiRes.json();
-
-    if (!apiRes.ok) {
-      throw new Error(`Google API 응답 실패 (${apiRes.status}): ${data.error?.message || JSON.stringify(data)}`);
+      } catch (e) {
+        lastError = e.message;
+      }
     }
 
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '번역 결과 텍스트를 찾지 못했습니다.';
-    console.log('[Gemini 응답 생성 완료]:', reply);
+    if (reply) {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.status(200).send(reply);
+    }
 
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.status(200).send(reply);
+    // 모든 모델 실패 시, 현재 API 키에서 사용 가능한 모델 목록을 조회해 클라이언트에 표시
+    let availableModels = '조회 실패';
+    try {
+      const listRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+      const listData = await listRes.json();
+      if (listData.models) {
+        availableModels = listData.models.map(m => m.name.replace('models/', '')).join(', ');
+      } else {
+        availableModels = listData.error?.message || JSON.stringify(listData);
+      }
+    } catch (listErr) {
+      availableModels = listErr.message;
+    }
+
+    throw new Error(`모든 모델 호출 실패. (마지막 에러: ${lastError})\n\n[내 API 키로 사용 가능한 모델 목록]:\n${availableModels}`);
+
   } catch (err) {
     console.error('[서버 통역 실패]:', err);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
