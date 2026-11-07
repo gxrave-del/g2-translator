@@ -1,5 +1,4 @@
 import express from 'express';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -16,16 +15,9 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// Gemini API 초기화
 const apiKey = process.env.GEMINI_API_KEY;
-let genAI = null;
-if (apiKey) {
-  genAI = new GoogleGenerativeAI(apiKey);
-} else {
-  console.error("경고: GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.");
-}
 
-const SYSTEM_INSTRUCTION = `
+const SYSTEM_PROMPT = `
 당신은 Even Realities G2 스마트 안경 전용 동시통역 엔진입니다.
 상대방의 외국어 음성을 분석하여 아래 서식대로 즉시 답변을 작성하세요:
 
@@ -50,24 +42,40 @@ app.post('/translate', async (req, res) => {
       return res.status(400).send('전송된 텍스트가 없습니다.');
     }
 
-    if (!genAI) {
+    if (!apiKey) {
       return res.status(500).send('서버에 GEMINI_API_KEY가 없습니다.');
     }
 
     console.log('[음성 수신]:', text);
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash-002',
-      systemInstruction: SYSTEM_INSTRUCTION,
-      generationConfig: {
-        temperature: 0.3,
-      }
+    // v1 정식 표준 엔드포인트로 직접 호출 (404 원천 차단)
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+
+    const apiResponse = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        system_instruction: {
+          parts: [{ text: SYSTEM_PROMPT }]
+        },
+        contents: [
+          {
+            parts: [{ text: text }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.3
+        }
+      })
     });
 
-    const result = await model.generateContent(text);
-    const response = await result.response;
-    const reply = response.text();
+    const data = await apiResponse.json();
 
+    if (!apiResponse.ok) {
+      throw new Error(`Google API 오류 (${apiResponse.status}): ${JSON.stringify(data.error || data)}`);
+    }
+
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '번역 텍스트를 파싱하지 못했습니다.';
     console.log('[Gemini 응답 생성 성공]:', reply);
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
