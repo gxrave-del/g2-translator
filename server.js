@@ -56,8 +56,8 @@ app.post('/translate', async (req, res) => {
 
     console.log('[음성 수신]:', text);
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+   const model = genAI.getGenerativeModel({
+  model: 'gemini-1.5-flash-latest',
       systemInstruction: SYSTEM_INSTRUCTION,
       generationConfig: {
         temperature: 0.3,
