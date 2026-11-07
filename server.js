@@ -1,5 +1,5 @@
 import express from 'express';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -16,13 +16,13 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// API 키를 명시적으로 전달하여 초기화 크래시 방지
+// Gemini API 초기화
 const apiKey = process.env.GEMINI_API_KEY;
-let ai = null;
+let genAI = null;
 if (apiKey) {
-  ai = new GoogleGenAI({ apiKey: apiKey });
+  genAI = new GoogleGenerativeAI(apiKey);
 } else {
-  console.error("경고: GEMINI_API_KEY 환경 변수가 없습니다.");
+  console.error("경고: GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.");
 }
 
 const SYSTEM_INSTRUCTION = `
@@ -42,7 +42,7 @@ app.post('/translate', async (req, res) => {
   try {
     const token = req.headers['x-app-token'];
     if (token && token !== APP_TOKEN) {
-      return res.status(401).send('인증 실패: 토큰 불일치');
+      return res.status(401).send('인증 실패: APP_TOKEN 불일치');
     }
 
     const { text } = req.body;
@@ -50,28 +50,30 @@ app.post('/translate', async (req, res) => {
       return res.status(400).send('전송된 텍스트가 없습니다.');
     }
 
-    if (!ai) {
-      return res.status(500).send('서버에 GEMINI_API_KEY가 설정되지 않았습니다.');
+    if (!genAI) {
+      return res.status(500).send('서버에 GEMINI_API_KEY가 없습니다. Render 환경변수를 확인하세요.');
     }
 
-    console.log('[요청 접수]:', text);
+    console.log('[음성 수신]:', text);
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: text,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-1.5-flash',
+      systemInstruction: SYSTEM_INSTRUCTION,
+      generationConfig: {
         temperature: 0.3,
       }
     });
 
-    const reply = response.text || '번역 결과 생성 실패';
-    console.log('[Gemini 응답]:', reply);
+    const result = await model.generateContent(text);
+    const response = await result.response;
+    const reply = response.text();
+
+    console.log('[Gemini 응답 생성 성공]:', reply);
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.status(200).send(reply);
   } catch (err) {
-    console.error('[Gemini 에러 상세]:', err);
+    console.error('[Gemini 호출 에러]:', err);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.status(200).send(`[API 오류 상세]\n${err.message || String(err)}`);
   }
