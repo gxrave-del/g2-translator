@@ -1,15 +1,23 @@
 import express from 'express';
-import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// CORS 전체 허용 (안경 웹뷰 및 로컬 테스트 허용)
-app.use(cors({ origin: '*' }));
+// CORS 설정 (외부 cors 패키지 없이 내장 헤더로 전체 허용)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
-// 1. 헬스체크 엔드포인트 (브라우저 직접 접속 확인용)
+// 1. 헬스체크 엔드포인트
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', service: 'g2-interpreter', timestamp: new Date().toISOString() });
 });
@@ -68,7 +76,7 @@ app.post('/translate', async (req, res) => {
 
     const result = JSON.parse(response.text.trim());
 
-    // 번역이 성공하면 안경 HUD에 표시될 문구를 자동으로 갱신
+    // 번역 성공 시 안경 HUD 텍스트 자동 갱신
     latestText = `${result.translation}`;
 
     return res.status(200).json(result);
