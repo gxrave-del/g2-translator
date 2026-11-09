@@ -19,16 +19,16 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// ★ [추가된 위치] 안경 HUD 실시간 창구
+// ★ Even G2 안경 HUD 실시간 창구
 // ==========================================
 let latestText = "Server Online!\nReady for stream";
 
-// 안경(G2)이 1초마다 최신 번역문을 조회하는 창구
+// 안경(G2)이 1초마다 최신 번역문을 조회하는 엔드포인트
 app.get('/latest-translation', (req, res) => {
   res.status(200).json({ text: latestText });
 });
 
-// 외부에서 직접 텍스트를 안경 화면으로 밀어넣는 창구
+// 외부에서 직접 텍스트를 안경 화면으로 밀어넣는 엔드포인트
 app.post('/push-translation', (req, res) => {
   const { text } = req.body;
   if (text) latestText = text;
@@ -68,7 +68,7 @@ app.post('/translate', async (req, res) => {
 
     const result = JSON.parse(response.text.trim());
 
-    // ★ 번역이 성공하면 안경 HUD에 표시될 문구를 자동으로 갱신
+    // 번역이 성공하면 안경 HUD에 표시될 문구를 자동으로 갱신
     latestText = `${result.translation}`;
 
     return res.status(200).json(result);
