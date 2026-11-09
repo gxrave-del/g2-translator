@@ -1,86 +1,64 @@
 import express from 'express';
+import cors from 'cors';
+import { GoogleGenAI } from '@google/genai';
 
 const app = express();
-const port = process.env.PORT || 10000;
-const APP_TOKEN = process.env.APP_TOKEN || 'my_g2_secret_1234';
+const port = process.env.PORT || 3000;
 
-// CORS 허용
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-app-token');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
+// CORS 전체 허용 (안경 웹뷰 및 로컬 테스트 허용)
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-const apiKey = process.env.GEMINI_API_KEY;
+// 1. 헬스체크 엔드포인트 (브라우저 직접 접속 확인용)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', service: 'g2-interpreter', timestamp: new Date().toISOString() });
+});
 
-const SYSTEM_PROMPT = `당신은 Even Realities G2 스마트 안경 전용 동시통역 엔진입니다.
-상대방 외국어를 듣고 반드시 아래 양식으로만 간결하게 출력하세요:
+app.get('/', (req, res) => {
+  res.status(200).send('G2 Translator Backend is Running');
+});
 
-[한국어 번역]
-(자연스러운 번역 문장)
-
-[추천 회신 답변]
-1. 긍정: (원어) / (한글발음) / (한국어 뜻)
-2. 거절/대안: (원어) / (한글발음) / (한국어 뜻)
-3. 역질문: (원어) / (한글발음) / (한국어 뜻)`;
-
+// 2. Gemini 번역 엔드포인트
 app.post('/translate', async (req, res) => {
   try {
-    const token = req.headers['x-app-token'];
-    if (token && token !== APP_TOKEN) {
-      return res.status(401).send('토큰 인증 실패: APP_TOKEN 불일치');
-    }
+    const { text, targetLang = 'ko' } = req.body;
 
-    const { text } = req.body;
     if (!text) {
-      return res.status(400).send('음성 텍스트가 없습니다.');
+      return res.status(400).json({ error: '텍스트가 입력되지 않았습니다.' });
     }
 
-    if (!apiKey) {
-      return res.status(500).send('서버에 GEMINI_API_KEY가 없습니다.');
-    }
+    const ai = new GoogleGenAI(); // 환경변수 GEMINI_API_KEY 자동 참조
+    const prompt = `당신은 Even Realities G2 스마트 안경 전용 통역사입니다.
+입력된 문장을 문맥에 맞게 ${targetLang === 'ko' ? '한국어' : '영어'}로 직관적이고 간결하게 번역하고,
+사용자가 이어서 말할 수 있는 짧은 답변 선택지 3개를 제안하세요.
 
-    console.log('[음성 수신]:', text);
+반드시 아래 JSON 형식으로만 응답하세요:
+{
+  "translation": "번역문",
+  "suggestions": ["1. 답변1", "2. 답변2", "3. 답변3"]
+}
 
-    // 안정적인 gemini-3.5-flash 호출
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`;
+입력 텍스트: "${text}"`;
 
-    const apiRes = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `${SYSTEM_PROMPT}\n\n[입력된 음성]: ${text}` }]
-          }
-        ],
-        generationConfig: {
-          temperature: 0.3
-        }
-      })
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json'
+      }
     });
 
-    const data = await apiRes.json();
+    const result = JSON.parse(response.text.trim());
+    return res.status(200).json(result);
 
-    if (!apiRes.ok) {
-      throw new Error(`Google API 호출 실패 (${apiRes.status}): ${data.error?.message || JSON.stringify(data)}`);
-    }
-
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '번역 결과 텍스트를 찾지 못했습니다.';
-    console.log('[통역 생성 성공]:', reply);
-
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.status(200).send(reply);
-
-  } catch (err) {
-    console.error('[서버 통역 실패]:', err);
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.status(200).send(`[API 오류 상세]\n${err.message || String(err)}`);
+  } catch (error) {
+    console.error('번역 처리 중 에러:', error);
+    return res.status(500).json({
+      error: 'Translation failed',
+      message: error.message,
+      translation: '번역 처리 실패 (서버 로그 확인)',
+      suggestions: ['다시 시도']
+    });
   }
 });
 
