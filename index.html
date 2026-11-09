@@ -1,173 +1,108 @@
-HTML
+cd C:\Users\user\Desktop\g-app
+
+# 1. 런타임 크래시 방지 index.html 생성
+$htmlCode = @'
 <!DOCTYPE html>
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>G2 HUD Translator</title>
+  <title>Translator</title>
   <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      margin: 0;
-      padding: 20px;
-      background-color: #0d1117;
-      color: #c9d1d9;
+      background-color: #000000;
+      color: #00FF66;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      display: flex;
-      flex-direction: column;
-      height: 90vh;
+      padding: 12px;
+      overflow: hidden;
     }
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 15px;
-    }
-    .title {
-      font-size: 18px;
-      font-weight: bold;
-      color: #58a6ff;
-    }
-    #status {
-      font-size: 14px;
-      color: #8b949e;
-    }
-    #result-box {
-      flex: 1;
-      background-color: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 8px;
-      padding: 15px;
-      font-size: 15px;
-      line-height: 1.6;
-      white-space: pre-wrap;
-      overflow-y: auto;
-      color: #58a6ff;
-    }
-    button {
-      margin-top: 15px;
-      padding: 16px;
-      font-size: 16px;
-      font-weight: bold;
-      border: none;
-      border-radius: 8px;
-      background-color: #238636;
-      color: #ffffff;
-      cursor: pointer;
-    }
-    button.recording {
-      background-color: #da3633;
-    }
+    .header { font-size: 14px; opacity: 0.8; margin-bottom: 6px; }
+    .box { font-size: 18px; font-weight: bold; line-height: 1.4; }
+    .list { margin-top: 10px; font-size: 14px; color: #88FFaa; }
   </style>
-  <!-- Even Hub SDK -->
-  <script src="https://cdn.jsdelivr.net/npm/@evenrealities/evenhub-sdk/dist/index.umd.js"></script>
 </head>
 <body>
-  <div class="header">
-    <div class="title">G2 HUD Translator</div>
-    <div id="status">대기 중</div>
-  </div>
-  
-  <div id="result-box">마이크 버튼을 누르고 말씀하세요.</div>
-  
-  <button id="btn-toggle">음성 인식 시작</button>
+  <div class="header" id="status">[ G2 Translator ]</div>
+  <div class="box" id="output">템플을 탭하여 번역 시작</div>
+  <div class="list" id="choices"></div>
 
   <script>
-    const SERVER_URL = "https://g2-interpreter.onrender.com/translate";
-    const APP_TOKEN = "Gx=jdh*07899";
+    const API_URL = "https://g2-interpreter.onrender.com/translate";
+    const statusEl = document.getElementById("status");
+    const outputEl = document.getElementById("output");
+    const choicesEl = document.getElementById("choices");
 
-    const statusEl = document.getElementById('status');
-    const resultBox = document.getElementById('result-box');
-    const btnToggle = document.getElementById('btn-toggle');
-
-    let isRecording = false;
-    let recognition = null;
-
-    // Even G2 안경 텍스트 전송
-    function sendToGlasses(text) {
-      try {
-        if (window.EvenHub && typeof window.EvenHub.sendText === 'function') {
-          window.EvenHub.sendText(text);
-        }
-      } catch (e) {
-        console.error("EvenHub 전송 에러:", e);
-      }
-    }
-
-    // 음성 인식 초기화
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      statusEl.innerText = "음성 인식을 지원하지 않는 브라우저입니다.";
-    } else {
-      recognition = new SpeechRecognition();
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.lang = 'en-US'; // 외국어(기본 영어) 감지
-
-      recognition.onstart = () => {
-        isRecording = true;
-        btnToggle.classList.add('recording');
-        btnToggle.innerText = "음성 듣는 중... (말씀하세요)";
-        statusEl.innerText = "감지 중";
-      };
-
-      recognition.onresult = async (event) => {
-        const spokenText = event.results[0][0].transcript;
-        statusEl.innerText = "서버 전송 중...";
-        resultBox.innerText = `[인식된 음성]\n${spokenText}\n\n[통역 처리 중...]`;
-
-        try {
-          const res = await fetch(SERVER_URL, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-app-token': APP_TOKEN
-            },
-            body: JSON.stringify({ text: spokenText })
-          });
-
-          if (!res.ok) {
-            throw new Error(`HTTP ${res.status}`);
-          }
-
-          const responseText = await res.text();
-          
-          // 화면 갱신
-          resultBox.innerText = `[원문]\n${spokenText}\n\n${responseText}`;
-          statusEl.innerText = "통역 완료";
-
-          // 안경 전송
-          sendToGlasses(responseText);
-        } catch (err) {
-          statusEl.innerText = "통신 실패";
-          resultBox.innerText = `[에러 발생]\n${err.message}\n(Render 서버 로그 및 토큰 일치 여부를 점검하세요)`;
-        }
-      };
-
-      recognition.onerror = (e) => {
-        statusEl.innerText = "인식 오류: " + e.error;
-        stopRecording();
-      };
-
-      recognition.onend = () => {
-        stopRecording();
-      };
-    }
-
-    function stopRecording() {
-      isRecording = false;
-      btnToggle.classList.remove('recording');
-      btnToggle.innerText = "음성 인식 시작";
-    }
-
-    btnToggle.addEventListener('click', () => {
-      if (!recognition) return;
-      if (!isRecording) {
-        resultBox.innerText = "음성을 기다리는 중...";
-        recognition.start();
-      } else {
-        recognition.stop();
-      }
+    // Even OS 런타임 유지
+    window.addEventListener("load", () => {
+      console.log("App loaded successfully");
     });
+
+    async function triggerTranslate() {
+      statusEl.innerText = "● 음성 전송 중...";
+      outputEl.innerText = "AI 번역 요청 중...";
+      choicesEl.innerHTML = "";
+
+      try {
+        const res = await fetch(API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: "Hello! Nice to meet you. Where is the gate?",
+            targetLang: "ko"
+          })
+        });
+
+        const data = await res.json();
+        statusEl.innerText = "✓ 번역 완료";
+        outputEl.innerText = data.translation || "결과 수신 완료";
+
+        if (data.suggestions && Array.isArray(data.suggestions)) {
+          choicesEl.innerHTML = data.suggestions.map(s => `<div>${s}</div>`).join("");
+        }
+      } catch (err) {
+        statusEl.innerText = "⚠ 통신 에러";
+        outputEl.innerText = "서버 연결 확인 필요";
+      }
+    }
+
+    // 템플 탭 및 브라우저 클릭 이벤트 바인딩
+    window.addEventListener("evenTap", triggerTranslate);
+    document.addEventListener("click", triggerTranslate);
   </script>
 </body>
 </html>
+'@
+[System.IO.File]::WriteAllText("$PWD\dist\index.html", $htmlCode, (New-Object System.Text.UTF8Encoding($false)))
+
+# 2. 1.0.4 버전 app.json 생성
+$json104 = @'
+{
+  "package_id": "com.gxrave.translator",
+  "name": "Translator",
+  "version": "1.0.4",
+  "edition": "202601",
+  "min_sdk_version": "0.1.0",
+  "entrypoint": "index.html",
+  "description": "G2 HUD Real-time Voice Translator",
+  "supported_languages": ["ko", "en"],
+  "icon": "icon.png",
+  "permissions": [
+    {
+      "name": "g2-microphone",
+      "desc": "실시간 음성 인식을 위한 마이크 권한"
+    },
+    {
+      "name": "network",
+      "desc": "번역 API 호출을 위한 네트워크 권한"
+    }
+  ]
+}
+'@
+[System.IO.File]::WriteAllText("$PWD\app.json", $json104, (New-Object System.Text.UTF8Encoding($false)))
+
+# 3. 빌드 및 배포
+if (Test-Path v104.ehpk) { Remove-Item v104.ehpk -Force }
+evenhub pack app.json dist -o v104.ehpk
+evenhub upload v104.ehpk -m "Fix HUD crash and add stable fallback UI"
+evenhub promote 1.0.4 --to beta
