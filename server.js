@@ -57,7 +57,7 @@ app.post('/translate', async (req, res) => {
     const language = targetLang === 'ko' ? '한국어' : '영어';
 
     const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
       contents: [
         `당신은 스마트 안경 전용 통역사입니다. 다음 발화를 ${language}로 문맥에 맞게 직관적이고 간결하게 번역하세요.`,
         '반드시 {"translation":"번역문","suggestions":["답변1","답변2","답변3"]} 형식의 순수 JSON으로만 응답하세요.',
