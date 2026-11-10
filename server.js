@@ -2,22 +2,23 @@ import express from 'express';
 import { GoogleGenAI } from '@google/genai';
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = Number(process.env.PORT || 3000);
 
-// CORS 설정 (외부 cors 패키지 없이 내장 헤더로 전체 허용)
+// CORS 수동 헤더 설정
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
 app.use(express.json());
 
-// 1. 헬스체크 엔드포인트
+// 안경 HUD용 최신 자막 변수
+let latestText = "Server Online!\nReady for stream";
+
+// 1. 헬스체크
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', service: 'g2-interpreter', timestamp: new Date().toISOString() });
 });
@@ -26,72 +27,60 @@ app.get('/', (req, res) => {
   res.status(200).send('G2 Translator Backend is Running');
 });
 
-// ==========================================
-// ★ Even G2 안경 HUD 실시간 창구
-// ==========================================
-let latestText = "Server Online!\nReady for stream";
-
-// 안경(G2)이 1초마다 최신 번역문을 조회하는 엔드포인트
+// 2. 안경 HUD 폴링 창구 (캐시 방지 헤더 적용)
 app.get('/latest-translation', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.status(200).json({ text: latestText });
 });
 
-// 외부에서 직접 텍스트를 안경 화면으로 밀어넣는 엔드포인트
+// 3. 외부 텍스트 직접 푸시
 app.post('/push-translation', (req, res) => {
-  const { text } = req.body;
+  const { text } = req.body ?? {};
   if (text) latestText = text;
   res.status(200).json({ ok: true, text: latestText });
 });
-// ==========================================
 
-// 2. Gemini 번역 엔드포인트
+// 4. Gemini 번역 처리
 app.post('/translate', async (req, res) => {
   try {
-    const { text, targetLang = 'ko' } = req.body;
-
-    if (!text) {
-      return res.status(400).json({ error: '텍스트가 입력되지 않았습니다.' });
+    const { text, targetLang = 'ko' } = req.body ?? {};
+    if (typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ error: 'No text provided' });
     }
 
-    const ai = new GoogleGenAI(); // 환경변수 GEMINI_API_KEY 자동 참조
-    const prompt = `당신은 Even Realities G2 스마트 안경 전용 통역사입니다.
-입력된 문장을 문맥에 맞게 ${targetLang === 'ko' ? '한국어' : '영어'}로 직관적이고 간결하게 번역하고,
-사용자가 이어서 말할 수 있는 짧은 답변 선택지 3개를 제안하세요.
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ error: 'Translation is not configured (Missing GEMINI_API_KEY)' });
+    }
 
-반드시 아래 JSON 형식으로만 응답하세요:
-{
-  "translation": "번역문",
-  "suggestions": ["1. 답변1", "2. 답변2", "3. 답변3"]
-}
-
-입력 텍스트: "${text}"`;
+    const ai = new GoogleGenAI({ apiKey });
+    const language = targetLang === 'ko' ? '한국어' : '영어';
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json'
-      }
+      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      contents: [
+        `당신은 스마트 안경 전용 통역사입니다. 다음 발화를 ${language}로 문맥에 맞게 직관적이고 간결하게 번역하세요.`,
+        '반드시 {"translation":"번역문","suggestions":["답변1","답변2","답변3"]} 형식의 순수 JSON으로만 응답하세요.',
+        `발화 원문: ${JSON.stringify(text.trim())}`
+      ].join('\n'),
+      config: { responseMimeType: 'application/json' },
     });
 
-    const result = JSON.parse(response.text.trim());
+    const result = JSON.parse(response.text ?? '{}');
+    if (!result.translation) {
+      return res.status(502).json({ error: 'Gemini returned no translation' });
+    }
 
-    // 번역 성공 시 안경 HUD 텍스트 자동 갱신
-    latestText = `${result.translation}`;
+    // 안경 화면에 즉시 노출되도록 자막 갱신
+    latestText = result.translation;
 
     return res.status(200).json(result);
-
   } catch (error) {
-    console.error('번역 처리 중 에러:', error);
-    return res.status(500).json({
-      error: 'Translation failed',
-      message: error.message,
-      translation: '번역 처리 실패 (서버 로그 확인)',
-      suggestions: ['다시 시도']
-    });
+    console.error('번역 처리 에러:', error);
+    return res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+app.listen(port, '0.0.0.0', () => {
+  console.log(`g2-interpreter is listening on port ${port}`);
 });
