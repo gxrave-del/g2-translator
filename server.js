@@ -4,16 +4,16 @@ import { GoogleGenAI } from '@google/genai';
 const app = express();
 const port = Number(process.env.PORT || 3000);
 
-// 환경 변수 검증 (비밀키 미설정 시 fallback 없이 경로 폐쇄)
+// 환경 변수 검증 (미설정 시 기본 오픈 없이 차단)
 const G2_READ_KEY = process.env.G2_READ_KEY?.trim();
 const G2_WRITE_KEY = process.env.G2_WRITE_KEY?.trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
 
 if (!G2_READ_KEY || !G2_WRITE_KEY) {
-  console.warn('[경고] Render 환경 변수에 G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다. 모든 보호 엔드포인트가 차단됩니다.');
+  console.warn('[경고] G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다.');
 }
 
-// CORS 설정 (헤더에 x-g2-key 허용)
+// CORS 설정
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -22,15 +22,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// JSON 파싱 전 크기 제한 (10KB 초과 요청 차단)
-app.use(express.json({ limit: '10kb' }));
-
 // G2 안경 렌즈 HUD 표시용 텍스트 상태
 let latestText = "Server Online!\nReady for stream";
 
-// ==========================================
-// 1. 보안 인증 미들웨어 (헤더 전용, 역할 분리)
-// ==========================================
+// 1. 헤더 인증 미들웨어 (JSON 파싱 전에 즉각 차단)
 const authenticate = (requiredRole) => {
   return (req, res, next) => {
     const key = req.headers['x-g2-key'];
@@ -52,9 +47,7 @@ const authenticate = (requiredRole) => {
   };
 };
 
-// ==========================================
-// 2. 비용 방어선 (Rate Limit & Concurrency Lock)
-// ==========================================
+// 2. 비용 방어선 (검증 통과 후에만 집계되는 Rate Limit)
 let isTranslating = false;
 let requestTimestamps = [];
 let dailyCount = 0;
@@ -64,45 +57,38 @@ const checkRateLimit = (req, res, next) => {
   const now = Date.now();
   const today = new Date().toDateString();
 
-  // 날짜 변경 시 일일 카운터 리셋
   if (today !== lastResetDate) {
     dailyCount = 0;
     lastResetDate = today;
   }
 
-  // 1) 일일 최대 200회 제한
   if (dailyCount >= 200) {
-    return res.status(429).json({ error: '일일 최대 번역 한도(200회)에 도달했습니다. 과금을 방지하기 위해 중단합니다.' });
+    return res.status(429).json({ error: '일일 최대 번역 한도에 도달했습니다.' });
   }
 
-  // 2) 최근 1분간 타임스탬프 정리 (슬라이딩 윈도우)
   requestTimestamps = requestTimestamps.filter(t => now - t < 60000);
-
-  // 3) 분당 최대 15회 제한
   if (requestTimestamps.length >= 15) {
-    return res.status(429).json({ error: '요청이 너무 빠릅니다. (분당 최대 15회 제한) 잠시 후 다시 시도하세요.' });
+    return res.status(429).json({ error: '요청이 너무 빠릅니다. 잠시 후 다시 시도하세요.' });
   }
 
-  // 4) 동시 요청 차단 (이전 번역이 처리 중일 때 중복 호출 방지)
   if (isTranslating) {
     return res.status(429).json({ error: '이전 번역 요청이 처리 중입니다.' });
   }
 
-  requestTimestamps.push(now);
-  dailyCount++;
   next();
 };
 
-// ==========================================
-// 3. 엔드포인트 라우팅
-// ==========================================
+const consumeRateLimit = () => {
+  requestTimestamps.push(Date.now());
+  dailyCount++;
+};
 
 // [공개] 헬스체크
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', service: 'g2-interpreter', timestamp: new Date().toISOString() });
 });
 
-// [공개] 스마트폰 마이크 UI (비밀키 입력창 내장, 소스에 키 노출 없음)
+// [공개] 스마트폰 마이크 UI (메모리 보관, localStorage 제거)
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -129,7 +115,7 @@ app.get('/', (req, res) => {
   <p>스마트폰 음성 입력 ➔ G2 안경 렌즈 투사</p>
 
   <div class="key-box">
-    <input type="password" id="writeKey" class="key-input" placeholder="스마트폰 쓰기 비밀키(G2_WRITE_KEY) 입력">
+    <input type="password" id="writeKey" class="key-input" placeholder="G2_WRITE_KEY 입력 (창 닫으면 초기화)">
   </div>
 
   <div class="mode-select">
@@ -148,10 +134,6 @@ app.get('/', (req, res) => {
     const recBtn = document.getElementById('recBtn');
     const resultBox = document.getElementById('resultBox');
     const langMode = document.getElementById('langMode');
-
-    // 키 로컬스토리지 보관
-    writeKeyInput.value = localStorage.getItem('g2_write_key') || '';
-    writeKeyInput.onchange = () => localStorage.setItem('g2_write_key', writeKeyInput.value.trim());
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
@@ -172,7 +154,7 @@ app.get('/', (req, res) => {
       recBtn.onclick = () => {
         const key = writeKeyInput.value.trim();
         if (!key) {
-          alert('상단에 G2_WRITE_KEY 비밀키를 먼저 입력하세요.');
+          alert('G2_WRITE_KEY 비밀키를 먼저 입력하세요.');
           return;
         }
 
@@ -186,7 +168,6 @@ app.get('/', (req, res) => {
             recBtn.classList.add('recording');
             resultBox.textContent = "음성을 듣고 있습니다...";
           } catch(e) {
-            console.error(e);
             resetButton();
           }
         } else {
@@ -202,7 +183,7 @@ app.get('/', (req, res) => {
       recognizer.onresult = async (event) => {
         resetButton();
         const spokenText = event.results[0][0].transcript;
-        resultBox.textContent = "인식: " + spokenText + "\\n번역 및 전송 요청 중...";
+        resultBox.textContent = "인식: " + spokenText + "\\n번역 요청 중...";
 
         try {
           const res = await fetch('/translate', {
@@ -217,15 +198,15 @@ app.get('/', (req, res) => {
           if (res.ok && data.translation) {
             resultBox.textContent = "원문: " + spokenText + "\\n안경 전송: " + data.translation;
           } else {
-            resultBox.textContent = "오류 (" + res.status + "): " + (data.error || '번역 실패');
+            resultBox.textContent = "요청 실패 (" + res.status + "): 다시 시도해 주세요.";
           }
         } catch (e) {
-          resultBox.textContent = "전송 실패: " + e.message;
+          resultBox.textContent = "네트워크 연결 실패";
         }
       };
 
-      recognizer.onerror = (e) => {
-        resultBox.textContent = "마이크 인식 오류: " + e.error;
+      recognizer.onerror = () => {
+        resultBox.textContent = "음성을 인식하지 못했습니다.";
         resetButton();
       };
     }
@@ -235,14 +216,14 @@ app.get('/', (req, res) => {
   `);
 });
 
-// [보안 읽기] G2 안경 렌즈 폴링 창구 (x-g2-key 인증 필수, 무인가 조회 차단)
+// [보안 읽기] G2 안경 렌즈 폴링 창구 (인증 필수)
 app.get('/latest-translation', authenticate('read'), (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.status(200).json({ text: latestText });
 });
 
 // [보안 쓰기] 직접 텍스트 푸시
-app.post('/push-translation', authenticate('write'), (req, res) => {
+app.post('/push-translation', authenticate('write'), express.json({ limit: '10kb' }), (req, res) => {
   const { text } = req.body ?? {};
   if (typeof text === 'string' && text.trim()) {
     latestText = text.trim();
@@ -250,78 +231,86 @@ app.post('/push-translation', authenticate('write'), (req, res) => {
   res.status(200).json({ ok: true, text: latestText });
 });
 
-// [보안 번역] Gemini 호출 (인증 ➔ 비용제한 ➔ 길이제한 ➔ AbortSignal)
-app.post('/translate', authenticate('write'), checkRateLimit, async (req, res) => {
-  const { text, targetLang = 'ko' } = req.body ?? {};
+// [보안 번역] 인증 ➔ 파싱 ➔ 입력/설정 검증 ➔ 한도 집계 ➔ Gemini 호출
+app.post(
+  '/translate',
+  authenticate('write'),
+  express.json({ limit: '10kb' }),
+  (req, res, next) => {
+    const { text } = req.body ?? {};
+    if (typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ error: 'No text provided' });
+    }
+    const cleanText = text.trim();
+    if (cleanText.length > 150) {
+      return res.status(400).json({ error: '발화 길이가 너무 깁니다 (최대 150자 제한)' });
+    }
+    if (!GEMINI_API_KEY) {
+      return res.status(503).json({ error: 'GEMINI_API_KEY가 서버에 구성되지 않았습니다.' });
+    }
+    req.cleanText = cleanText;
+    next();
+  },
+  checkRateLimit,
+  async (req, res) => {
+    // 모든 검증 통과 후 카운터 차감 및 락 획득
+    consumeRateLimit();
+    isTranslating = true;
 
-  // 입력값 검증 및 글자 수 제한 (비용 공격 방어)
-  if (typeof text !== 'string' || !text.trim()) {
-    return res.status(400).json({ error: 'No text provided' });
-  }
+    const { targetLang = 'ko' } = req.body ?? {};
+    const signal = AbortSignal.timeout(8000); // 8초 타임아웃
+    const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+    const language = targetLang === 'ko' ? '한국어' : '영어';
 
-  const cleanText = text.trim();
-  if (cleanText.length > 150) {
-    return res.status(400).json({ error: '발화 길이가 너무 깁니다 (최대 150자 제한)' });
-  }
+    const contents = [
+      `당신은 스마트 안경 전용 통역사입니다. 다음 발화를 ${language}로 문맥에 맞게 직관적이고 간결하게 번역하세요.`,
+      '응답은 반드시 선언된 JSON 스키마 규격에 맞춰 translation과 suggestions 배열 3개를 반환하세요.',
+      `발화 원문: ${JSON.stringify(req.cleanText)}`
+    ].join('\n');
 
-  if (!GEMINI_API_KEY) {
-    return res.status(503).json({ error: 'GEMINI_API_KEY is not configured on server' });
-  }
-
-  isTranslating = true;
-  const signal = AbortSignal.timeout(6000); // 6초 타임아웃
-  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-  const language = targetLang === 'ko' ? '한국어' : '영어';
-
-  const contents = [
-    `당신은 스마트 안경 전용 통역사입니다. 다음 발화를 ${language}로 문맥에 맞게 직관적이고 간결하게 번역하세요.`,
-    '응답은 반드시 선언된 JSON 스키마 규격에 맞춰 translation과 suggestions 배열 3개를 반환하세요.',
-    `발화 원문: ${JSON.stringify(cleanText)}`
-  ].join('\n');
-
-  try {
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
-      contents,
-      config: {
-        abortSignal: signal,
-        responseMimeType: 'application/json',
-        responseJsonSchema: {
-          type: 'object',
-          properties: {
-            translation: { type: 'string' },
-            suggestions: {
-              type: 'array',
-              items: { type: 'string' },
-              minItems: 3,
-              maxItems: 3,
+    try {
+      const response = await ai.models.generateContent({
+        model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
+        contents,
+        config: {
+          abortSignal: signal,
+          responseMimeType: 'application/json',
+          responseJsonSchema: {
+            type: 'object',
+            properties: {
+              translation: { type: 'string' },
+              suggestions: {
+                type: 'array',
+                items: { type: 'string' },
+                minItems: 3,
+                maxItems: 3,
+              },
             },
+            required: ['translation', 'suggestions'],
           },
-          required: ['translation', 'suggestions'],
         },
-      },
-    });
+      });
 
-    const result = JSON.parse(response.text ?? '{}');
-    if (typeof result.translation !== 'string' || !result.translation.trim()) {
-      return res.status(502).json({ error: 'Gemini returned no translation' });
+      const result = JSON.parse(response.text ?? '{}');
+      if (typeof result.translation !== 'string' || !result.translation.trim()) {
+        return res.status(502).json({ error: 'Gemini returned no translation' });
+      }
+
+      latestText = result.translation.trim();
+      return res.status(200).json(result);
+
+    } catch (error) {
+      if (signal.aborted) {
+        console.error('[Gemini 타임아웃] 응답 대기 시간 초과');
+        return res.status(504).json({ error: 'Gemini translation timed out' });
+      }
+      console.error('[Gemini API 오류]:', error);
+      return res.status(500).json({ error: 'Translation failed' });
+    } finally {
+      isTranslating = false;
     }
-
-    // 검증된 번역문만 HUD 상태값에 반영 (에러 시에는 마지막 정상 텍스트 유지)
-    latestText = result.translation.trim();
-    return res.status(200).json(result);
-
-  } catch (error) {
-    if (signal.aborted) {
-      console.error('[Gemini 타임아웃] 6초 초과로 소켓 절단');
-      return res.status(504).json({ error: 'Gemini translation timed out' });
-    }
-    console.error('[Gemini API 오류]:', error);
-    return res.status(500).json({ error: error.message || 'Translation failed' });
-  } finally {
-    isTranslating = false; // 동시 실행 락 해제
   }
-});
+);
 
 app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter secure server listening on port ${port}`);
