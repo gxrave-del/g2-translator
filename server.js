@@ -258,6 +258,7 @@ app.post(
     isTranslating = true;
 
     const { targetLang = 'ko' } = req.body ?? {};
+    const cleanText = req.cleanText;
     const signal = AbortSignal.timeout(8000); // 8초 타임아웃
     const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
     const language = targetLang === 'ko' ? '한국어' : '영어';
