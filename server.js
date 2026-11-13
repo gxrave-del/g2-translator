@@ -8,6 +8,8 @@ const port = Number(process.env.PORT || 3000);
 const G2_READ_KEY = process.env.G2_READ_KEY?.trim();
 const G2_WRITE_KEY = process.env.G2_WRITE_KEY?.trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
+const G2_AUDIO_KEY = process.env.G2_AUDIO_KEY?.trim();
+const MAX_AUDIO_BYTES = 16_000 * 2 * 8;
 
 if (!G2_READ_KEY || !G2_WRITE_KEY) {
   console.warn('[경고] G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다.');
@@ -36,7 +38,13 @@ const authenticate = (requiredRole) => {
     if (!G2_READ_KEY || !G2_WRITE_KEY) {
       return res.status(503).json({ error: '서버 인증 키가 구성되지 않았습니다.' });
     }
-
+if (requiredRole === 'audio') {
+  if (!G2_AUDIO_KEY) {
+    return res.status(503).json({ error: '안경 마이크 키가 설정되지 않았습니다.' });
+  }
+  if (key === G2_AUDIO_KEY) return next();
+  return res.status(403).json({ error: '안경 마이크 키를 확인해 주세요.' });
+}
     if (requiredRole === 'read') {
       if (key === G2_READ_KEY || key === G2_WRITE_KEY) return next();
     } else if (requiredRole === 'write') {
@@ -232,23 +240,44 @@ app.post('/push-translation', authenticate('write'), express.json({ limit: '10kb
 });
 
 // [보안 번역] 인증 ➔ 파싱 ➔ 입력/설정 검증 ➔ 한도 집계 ➔ Gemini 호출
+const parseText = express.json({ limit: '10kb' });
+const parseAudio = express.raw({
+  type: 'application/octet-stream',
+  limit: MAX_AUDIO_BYTES,
+  inflate: false,
+});
+
 app.post(
-  '/translate',
-  authenticate('write'),
-  express.json({ limit: '10kb' }),
+  ['/translate', '/translate-audio'],
   (req, res, next) => {
-    const { text } = req.body ?? {};
-    if (typeof text !== 'string' || !text.trim()) {
-      return res.status(400).json({ error: 'No text provided' });
+    req.fromGlasses = req.path === '/translate-audio';
+    authenticate(req.fromGlasses ? 'audio' : 'write')(req, res, next);
+  },
+  (req, res, next) => {
+    const parse = req.fromGlasses ? parseAudio : parseText;
+    parse(req, res, next);
+  },
+  (req, res, next) => {
+    if (req.fromGlasses) {
+      if (!Buffer.isBuffer(req.body) ||
+          req.body.length < 3_200 ||
+          req.body.length % 2 !== 0) {
+        return res.status(400).json({ error: '녹음이 너무 짧거나 형식이 올바르지 않습니다.' });
+      }
+    } else {
+      const { text } = req.body ?? {};
+      if (typeof text !== 'string' || !text.trim()) {
+        return res.status(400).json({ error: 'No text provided' });
+      }
+      req.cleanText = text.trim();
+      if (req.cleanText.length > 150) {
+        return res.status(400).json({ error: '발화 길이가 너무 깁니다 (최대 150자 제한)' });
+      }
     }
-    const cleanText = text.trim();
-    if (cleanText.length > 150) {
-      return res.status(400).json({ error: '발화 길이가 너무 깁니다 (최대 150자 제한)' });
-    }
+
     if (!GEMINI_API_KEY) {
       return res.status(503).json({ error: 'GEMINI_API_KEY가 서버에 구성되지 않았습니다.' });
     }
-    req.cleanText = cleanText;
     next();
   },
   checkRateLimit,
@@ -259,7 +288,7 @@ app.post(
 
     const { targetLang = 'ko' } = req.body ?? {};
     const cleanText = req.cleanText;
-    const signal = AbortSignal.timeout(8000); // 8초 타임아웃
+    const signal = AbortSignal.timeout(req.fromGlasses ? 15_000 : 8_000); // 8초 타임아웃
     const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
     const language = targetLang === 'ko' ? '한국어' : '영어';
 
@@ -275,15 +304,52 @@ app.post(
 ].join('\n');
 
     try {
+      let modelContents = contents;
+
+if (req.fromGlasses) {
+  const pcm = req.body;
+  const wav = Buffer.alloc(44 + pcm.length);
+
+  wav.write('RIFF', 0);
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);       // PCM
+  wav.writeUInt16LE(1, 22);       // 모노
+  wav.writeUInt32LE(16_000, 24);  // 샘플레이트
+  wav.writeUInt32LE(32_000, 28);  // 초당 바이트 수
+  wav.writeUInt16LE(2, 32);       // 샘플당 바이트 수
+  wav.writeUInt16LE(16, 34);      // 비트 깊이
+  wav.write('data', 36);
+  wav.writeUInt32LE(pcm.length, 40);
+  pcm.copy(wav, 44);
+
+  modelContents = [{
+    role: 'user',
+    parts: [
+      {
+        text: [
+          '녹음에서 명확하게 들리는 발화를 원래 언어 그대로 original에 적으세요.',
+          '그 발화를 자연스럽고 간결하게 한국어로 번역해 translation에 적으세요.',
+          'suggestions에는 긍정, 정중한 거절 또는 대안, 역질문 순서로 짧은 답변을 3개 작성하세요.',
+          '각 답변은 발화와 같은 언어로 reply에 적고, pronunciation에는 한글 발음, meaning에는 한국어 뜻을 적으세요.',
+          '명확한 발화가 없으면 original을 빈 문자열로 반환하세요. 들리지 않은 말을 지어내지 마세요.',
+        ].join('\n'),
+      },
+      { inlineData: { mimeType: 'audio/wav', data: wav.toString('base64') } },
+    ],
+  }];
+}
 const response = await ai.models.generateContent({
   model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
-  contents,
+  contents: modelContents,
   config: {
     abortSignal: signal,
     responseMimeType: 'application/json',
     responseJsonSchema: {
       type: 'object',
       properties: {
+        ...(req.fromGlasses ? { original: { type: 'string' } } : {}),
         translation: { type: 'string' },
         suggestions: {
           type: 'array',
@@ -300,13 +366,20 @@ const response = await ai.models.generateContent({
           },
         },
       },
-      required: ['translation', 'suggestions'],
+      required: req.fromGlasses
+  ? ['original', 'translation', 'suggestions']
+  : ['translation', 'suggestions'],
     },
   },
 });
 
 const result = JSON.parse(response.text ?? '{}');
 const isText = (value) => typeof value === 'string' && value.trim().length > 0;
+      const original = req.fromGlasses ? result?.original?.trim() : cleanText;
+
+if (!isText(original)) {
+  return res.status(422).json({ error: '음성을 인식하지 못했습니다.' });
+}
 const suggestions = result?.suggestions;
 
 if (
@@ -332,12 +405,13 @@ const replyBlocks = suggestions.map((item, index) => [
   item.meaning.trim(),
 ].join('\n'));
 
-latestText = [cleanText, translation, '', replyBlocks.join('\n\n')].join('\n');
+latestText = [original, translation, '', replyBlocks.join('\n\n')].join('\n');
 
 return res.status(200).json({
-  original: cleanText,
+  original,
   translation,
   suggestions,
+  text: latestText,
 });
 
     } catch (error) {
