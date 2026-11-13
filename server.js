@@ -263,41 +263,81 @@ app.post(
     const language = targetLang === 'ko' ? '한국어' : '영어';
 
     const contents = [
-      `당신은 스마트 안경 전용 통역사입니다. 다음 발화를 ${language}로 문맥에 맞게 직관적이고 간결하게 번역하세요.`,
-      '응답은 반드시 선언된 JSON 스키마 규격에 맞춰 translation과 suggestions 배열 3개를 반환하세요.',
-      `발화 원문: ${JSON.stringify(req.cleanText)}`
-    ].join('\n');
+  `당신은 스마트 안경용 통역사입니다. 발화를 ${language}로 자연스럽고 간결하게 번역하세요.`,
+  'suggestions에는 상대에게 바로 말할 수 있는 짧은 답변을 다음 순서로 3개 작성하세요.',
+  '1번 긍정 또는 수락, 2번 정중한 거절 또는 대안, 3번 상황을 확인하는 역질문.',
+  '각 답변은 상대방의 언어로 작성하고, 추천 답변의 한글 발음과 한국어 뜻을 함께 적으세요.',
+  '입력 발화가 한국어이고 영어로 번역하는 모드에서는 추천 답변도 영어로 작성하세요.',
+  '추천 답변은 각각 한 문장으로 짧게 쓰고, 아래 필드에 맞는 JSON으로 응답하세요.',
+  '형식: {"translation":"번역","suggestions":[{"reply":"외국어 답변","pronunciation":"한글 발음","meaning":"한국어 뜻"}]}',
+  `발화 원문: ${JSON.stringify(cleanText)}`,
+].join('\n');
 
     try {
-      const response = await ai.models.generateContent({
-        model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
-        contents,
-        config: {
-          abortSignal: signal,
-          responseMimeType: 'application/json',
-          responseJsonSchema: {
+const response = await ai.models.generateContent({
+  model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
+  contents,
+  config: {
+    abortSignal: signal,
+    responseMimeType: 'application/json',
+    responseJsonSchema: {
+      type: 'object',
+      properties: {
+        translation: { type: 'string' },
+        suggestions: {
+          type: 'array',
+          minItems: 3,
+          maxItems: 3,
+          items: {
             type: 'object',
             properties: {
-              translation: { type: 'string' },
-              suggestions: {
-                type: 'array',
-                items: { type: 'string' },
-                minItems: 3,
-                maxItems: 3,
-              },
+              reply: { type: 'string' },
+              pronunciation: { type: 'string' },
+              meaning: { type: 'string' },
             },
-            required: ['translation', 'suggestions'],
+            required: ['reply', 'pronunciation', 'meaning'],
           },
         },
-      });
+      },
+      required: ['translation', 'suggestions'],
+    },
+  },
+});
 
-      const result = JSON.parse(response.text ?? '{}');
-      if (typeof result.translation !== 'string' || !result.translation.trim()) {
-        return res.status(502).json({ error: 'Gemini returned no translation' });
-      }
+const result = JSON.parse(response.text ?? '{}');
+const isText = (value) => typeof value === 'string' && value.trim().length > 0;
+const suggestions = result?.suggestions;
 
-      latestText = result.translation.trim();
-      return res.status(200).json(result);
+if (
+  !isText(result?.translation) ||
+  !Array.isArray(suggestions) ||
+  suggestions.length !== 3 ||
+  !suggestions.every((item) =>
+    isText(item?.reply) &&
+    isText(item?.pronunciation) &&
+    isText(item?.meaning)
+  )
+) {
+  return res.status(502).json({ error: '번역 결과의 형식이 올바르지 않습니다.' });
+}
+
+const translation = result.translation.trim();
+const labels = ['긍정', '거절·대안', '역질문'];
+
+const replyBlocks = suggestions.map((item, index) => [
+  `${index + 1}. ${labels[index]}`,
+  item.reply.trim(),
+  item.pronunciation.trim(),
+  item.meaning.trim(),
+].join('\n'));
+
+latestText = [cleanText, translation, '', replyBlocks.join('\n\n')].join('\n');
+
+return res.status(200).json({
+  original: cleanText,
+  translation,
+  suggestions,
+});
 
     } catch (error) {
       if (signal.aborted) {
