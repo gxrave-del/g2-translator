@@ -9,7 +9,7 @@ const G2_READ_KEY = process.env.G2_READ_KEY?.trim();
 const G2_WRITE_KEY = process.env.G2_WRITE_KEY?.trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
 const G2_AUDIO_KEY = process.env.G2_AUDIO_KEY?.trim();
-const MAX_AUDIO_BYTES = 16_000 * 2 * 20;
+const MAX_AUDIO_BYTES = 16_000 * 2 * 30;
 
 if (!G2_READ_KEY || !G2_WRITE_KEY) {
   console.warn('[경고] G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다.');
