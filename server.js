@@ -1,5 +1,3 @@
-
-
 import { setTimeout as delay } from 'node:timers/promises';
 import express from 'express';
 import { GoogleGenAI, Modality } from '@google/genai';
@@ -633,7 +631,3 @@ liveSockets.on('connection', (client) => {
   client.on('close', () => end());
   client.on('error', () => end());
 });
-
-
-
-
