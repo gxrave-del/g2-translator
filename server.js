@@ -15,7 +15,8 @@ const MAX_AUDIO_SECONDS = 30;
 const MAX_AUDIO_BYTES = SAMPLE_RATE * 2 * MAX_AUDIO_SECONDS;
 const LIVE_CHUNK_BYTES = SAMPLE_RATE * 2 / 10;
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL?.trim() || 'gemini-3.5-live-translate-preview';
-const FINAL_MODEL = process.env.GEMINI_FINAL_MODEL?.trim() || 'gemini-4-hydrogen';
+const FINAL_MODEL = 'gemini-3.5-flash-lite';
+console.log('[최종 번역 모델]', FINAL_MODEL);
 
 if (!G2_READ_KEY || !G2_WRITE_KEY) {
   console.warn('[경고] G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다.');
