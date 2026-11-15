@@ -1,3 +1,6 @@
+
+
+import { setTimeout as delay } from 'node:timers/promises';
 import express from 'express';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -16,7 +19,7 @@ const MAX_AUDIO_BYTES = SAMPLE_RATE * 2 * MAX_AUDIO_SECONDS;
 const LIVE_CHUNK_BYTES = SAMPLE_RATE * 2 / 10;
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL?.trim() || 'gemini-3.5-live-translate-preview';
 const FINAL_MODEL = 'gemini-3.5-flash-lite';
-console.log('[최종 번역 모델]', FINAL_MODEL);
+const FINAL_BACKUP_MODEL = 'gemini-3.1-flash-lite';
 
 if (!G2_READ_KEY || !G2_WRITE_KEY) {
   console.warn('[경고] G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다.');
@@ -249,6 +252,23 @@ const parseAudio = express.raw({
   inflate: false,
 });
 
+async function generateBeforeDeadline(ai, request, signal) {
+  signal.throwIfAborted();
+
+  // SDK 응답과 별도로 요청 처리의 마감 시간도 지킵니다.
+  let onAbort;
+  const deadline = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([ai.models.generateContent(request), deadline]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 app.post(
   ['/translate', '/translate-audio'],
   (req, res, next) => {
@@ -291,11 +311,22 @@ app.post(
 
     isTranslating = true;
     const liveFinal = req.fromGlasses && req.query.mode === 'live';
-    const model = liveFinal
+    let model = liveFinal
       ? FINAL_MODEL
       : process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite';
     const timeout = liveFinal ? 20_000 : req.fromGlasses ? 15_000 : 8_000;
     const signal = AbortSignal.timeout(timeout);
+    const startedAt = performance.now();
+
+    if (liveFinal) {
+      res.once('finish', () => {
+        console.info('[최종 번역 응답]', {
+          model,
+          status: res.statusCode,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+      });
+    }
 
     try {
       const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
@@ -330,7 +361,7 @@ app.post(
             `발화 원문: ${JSON.stringify(req.cleanText)}`,
           ].join('\n');
 
-      const response = await ai.models.generateContent({
+      const translate = () => generateBeforeDeadline(ai, {
         model,
         contents,
         config: {
@@ -362,7 +393,23 @@ app.post(
               : ['translation', 'suggestions'],
           },
         },
-      });
+      }, signal);
+
+      let response;
+      try {
+        response = await translate();
+      } catch (error) {
+        if (!liveFinal || error.status !== 503 || signal.aborted) throw error;
+
+        // 한 번만 전환하고, 두 모델에 같은 마감 시간과 호출 한도를 적용합니다.
+        await delay(500, undefined, { signal });
+        const backupLimitError = reserveTranslation();
+        if (backupLimitError) return res.status(429).json({ error: backupLimitError });
+
+        console.warn('[최종 번역 모델 전환]', { from: model, to: FINAL_BACKUP_MODEL, status: 503 });
+        model = FINAL_BACKUP_MODEL;
+        response = await translate();
+      }
 
       const result = JSON.parse(response.text ?? '{}');
       const isText = (value) => typeof value === 'string' && value.trim().length > 0;
@@ -398,6 +445,9 @@ app.post(
         return res.status(504).json({ error: '번역 응답이 늦어졌습니다.' });
       }
       console.error('[Gemini 번역 오류]', { model, name: error.name, status: error.status });
+      if (liveFinal && error.status === 503) {
+        return res.status(503).json({ error: '번역 서비스가 잠시 혼잡합니다.' });
+      }
       return res.status(500).json({ error: '번역을 마치지 못했습니다.' });
     } finally {
       isTranslating = false;
@@ -425,6 +475,7 @@ function toWav(pcm) {
 
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter listening on port ${port}`);
+  console.info('[최종 번역 모델]', FINAL_MODEL, '예비 모델', FINAL_BACKUP_MODEL);
 });
 
 const liveSockets = new WebSocketServer({
@@ -582,3 +633,7 @@ liveSockets.on('connection', (client) => {
   client.on('close', () => end());
   client.on('error', () => end());
 });
+
+
+
+
