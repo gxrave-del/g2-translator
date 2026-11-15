@@ -12,7 +12,7 @@ const G2_WRITE_KEY = process.env.G2_WRITE_KEY?.trim();
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
 const G2_AUDIO_KEY = process.env.G2_AUDIO_KEY?.trim();
 const SAMPLE_RATE = 16_000;
-const MAX_AUDIO_SECONDS = 30;
+const MAX_AUDIO_SECONDS = 60;
 const MAX_AUDIO_BYTES = SAMPLE_RATE * 2 * MAX_AUDIO_SECONDS;
 const LIVE_CHUNK_BYTES = SAMPLE_RATE * 2 / 10;
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL?.trim() || 'gemini-3.5-live-translate-preview';
@@ -578,7 +578,10 @@ liveSockets.on('connection', (client) => {
       liveSession = session;
       phase = 'captions';
       clearTimeout(deadline);
-      deadline = setTimeout(() => end(408, '실시간 자막 시간이 끝났습니다.'), 35_000);
+      deadline = setTimeout(
+        () => end(408, '실시간 자막 시간이 끝났습니다.'),
+        (MAX_AUDIO_SECONDS + 5) * 1_000,
+      );
       client.send(JSON.stringify({ type: 'ready' }));
     } catch (error) {
       if (phase === 'closed') return;
@@ -619,7 +622,9 @@ liveSockets.on('connection', (client) => {
     }
 
     pcmBytes += data.length;
-    if (pcmBytes > MAX_AUDIO_BYTES) return end(413, '30초 녹음 한도를 초과했습니다.');
+    if (pcmBytes > MAX_AUDIO_BYTES) {
+      return end(413, `${MAX_AUDIO_SECONDS}초 녹음 한도를 초과했습니다.`);
+    }
 
     try {
       liveSession.sendRealtimeInput({
