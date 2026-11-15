@@ -18,6 +18,7 @@ const LIVE_CHUNK_BYTES = SAMPLE_RATE * 2 / 10;
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL?.trim() || 'gemini-3.5-live-translate-preview';
 const FINAL_MODEL = 'gemini-3.5-flash-lite';
 const FINAL_BACKUP_MODEL = 'gemini-3.1-flash-lite';
+const REPLY_LABELS = ['긍정', '거절·대안', '역질문', '위트'];
 
 if (!G2_READ_KEY || !G2_WRITE_KEY) {
   console.warn('[경고] G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다.');
@@ -332,8 +333,9 @@ app.post(
       const language = targetLang === 'ko' ? '한국어' : '영어';
 
       const replyInstructions = [
-        '상대에게 바로 말할 수 있는 답변을 세 가지 만드세요.',
-        '긍정·수락, 정중한 거절·대안, 상황을 확인하는 역질문 순서로 각각 한 문장씩 적으세요.',
+        `상대에게 바로 말할 수 있는 답변을 ${REPLY_LABELS.length}개 만드세요.`,
+        'suggestions 배열에 1번 긍정·수락, 2번 정중한 거절·대안, 3번 상황을 확인하는 역질문, 4번 위트 순으로 적으세요.',
+        '답변은 각각 짧은 한 문장으로 쓰세요. 4번은 상황에 어울리는 가볍고 재치 있는 한마디로 쓰세요.',
         '답변의 reply에는 상대의 언어로 쓴 문장, pronunciation에는 한글 발음, meaning에는 한국어 뜻을 적으세요.',
         '상대가 말한 장소, 숫자, 부정 표현을 살리세요. 확인되지 않은 사실을 지어내지 마세요.',
       ];
@@ -373,8 +375,8 @@ app.post(
               translation: { type: 'string' },
               suggestions: {
                 type: 'array',
-                minItems: 3,
-                maxItems: 3,
+                minItems: REPLY_LABELS.length,
+                maxItems: REPLY_LABELS.length,
                 items: {
                   type: 'object',
                   properties: {
@@ -419,7 +421,7 @@ app.post(
       const suggestions = result?.suggestions;
       if (!isText(result?.translation) ||
           !Array.isArray(suggestions) ||
-          suggestions.length !== 3 ||
+          suggestions.length !== REPLY_LABELS.length ||
           !suggestions.every((item) =>
             isText(item?.reply) && isText(item?.pronunciation) && isText(item?.meaning)
           )) {
@@ -427,9 +429,8 @@ app.post(
       }
 
       const translation = result.translation.trim();
-      const labels = ['긍정', '거절·대안', '역질문'];
       const replyBlocks = suggestions.map((item, index) => [
-        `${index + 1}. ${labels[index]}`,
+        `${index + 1}. ${REPLY_LABELS[index]}`,
         item.reply.trim(),
         item.pronunciation.trim(),
         item.meaning.trim(),
