@@ -19,6 +19,148 @@ const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL?.trim() || 'gemini-3.5-live-tra
 const FINAL_MODEL = 'gemini-3.5-flash-lite';
 const FINAL_BACKUP_MODEL = 'gemini-3.1-flash-lite';
 const REPLY_LABELS = ['긍정', '거절·대안', '역질문', '위트'];
+const REPLY_INSTRUCTIONS = [
+  '상대에게 바로 말할 수 있는 답변을 4개 만드세요.',
+  '1번 긍정·수락, 2번 정중한 거절·대안, 3번 상황을 확인하는 역질문, 4번 가볍고 재치 있는 위트 순서입니다.',
+  'reply는 상대의 언어로 짧은 한 문장, pronunciation은 한글 발음, meaning은 한국어 뜻입니다.',
+  '숫자, 장소, 부정 표현을 보존하고 사실을 지어내지 마세요.',
+];
+
+function makeFinalResult(result, original = result?.original) {
+  const isText = (value) => typeof value === 'string' && value.trim().length > 0;
+  if (!isText(original)) {
+    throw Object.assign(new Error('음성을 인식하지 못했습니다.'), { status: 422 });
+  }
+  if (!isText(result?.translation) || !Array.isArray(result.suggestions) ||
+      result.suggestions.length !== REPLY_LABELS.length ||
+      !result.suggestions.every((item) =>
+        isText(item?.reply) && isText(item?.pronunciation) && isText(item?.meaning))) {
+    throw Object.assign(new Error('번역 결과의 형식이 올바르지 않습니다.'), { status: 502 });
+  }
+  const translation = result.translation.trim();
+  const replyBlocks = result.suggestions.map((item, index) => [
+    `${index + 1}. ${REPLY_LABELS[index]}`,
+    item.reply.trim(), item.pronunciation.trim(), item.meaning.trim(),
+  ].join('\n'));
+  return {
+    original: original.trim(), translation, suggestions: result.suggestions,
+    text: [original.trim(), translation, '', replyBlocks.join('\n\n')].join('\n'),
+  };
+}
+
+// 닫힌 JSON 문자열만 읽어서 추천 답변보다 먼저 완성된 번역을 보냅니다.
+function readTranslationPrefix(text, original) {
+  const match = original
+    ? text.match(/^\s*\{\s*"translation"\s*:\s*("(?:[^"\\]|\\.)*")\s*[,}]/)
+    : text.match(/^\s*\{\s*"original"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"translation"\s*:\s*("(?:[^"\\]|\\.)*")\s*[,}]/);
+  if (!match) return null;
+  const source = original || JSON.parse(match[1]);
+  const translation = JSON.parse(match[original ? 1 : 2]);
+  if (!source.trim() || !translation.trim()) return null;
+  return { original: source.trim(), translation: translation.trim() };
+}
+
+async function beforeAbort(promise, signal) {
+  if (signal.aborted) {
+    promise.catch(() => {});
+    throw signal.reason;
+  }
+  let onAbort;
+  const cancelled = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, cancelled]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation) {
+  const instructions = [
+    translation
+      ? '아래 발화 원문과 한국어 번역을 바탕으로 suggestions만 작성하세요.'
+      : original
+      ? '발화 원문 전체를 생략하지 말고 자연스러운 한국어로 번역해 translation에 적으세요.'
+      : '음성 전체를 원래 언어 그대로 original에 적고, 자연스러운 한국어 번역을 translation에 적으세요. 말소리가 없으면 original은 빈 문자열입니다.',
+    ...REPLY_INSTRUCTIONS,
+    original ? `발화 원문: ${JSON.stringify(original)}` : '',
+    translation ? `한국어 번역: ${JSON.stringify(translation)}` : '',
+  ].filter(Boolean).join('\n');
+  const contents = original ? instructions : [{ role: 'user', parts: [
+    { text: instructions },
+    { inlineData: { mimeType: 'audio/wav', data: toWav(pcm).toString('base64') } },
+  ] }];
+  const schema = {
+    type: 'object',
+    properties: {
+      ...(original ? {} : { original: { type: 'string' } }),
+      ...(translation ? {} : { translation: { type: 'string' } }),
+      suggestions: {
+        type: 'array', minItems: 4, maxItems: 4,
+        items: {
+          type: 'object',
+          properties: {
+            reply: { type: 'string' }, pronunciation: { type: 'string' }, meaning: { type: 'string' },
+          },
+          required: ['reply', 'pronunciation', 'meaning'],
+        },
+      },
+    },
+    required: translation ? ['suggestions'] : original ? ['translation', 'suggestions'] : ['original', 'translation', 'suggestions'],
+    propertyOrdering: translation ? ['suggestions'] : original ? ['translation', 'suggestions'] : ['original', 'translation', 'suggestions'],
+  };
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  let sentTranslation = false;
+  let model = FINAL_MODEL;
+  async function generate() {
+    const iterator = await beforeAbort(ai.models.generateContentStream({
+      model, contents,
+      config: {
+        abortSignal: signal,
+        automaticContinuation: false,
+        thinkingConfig: { thinkingLevel: 'MINIMAL' },
+        responseMimeType: 'application/json', responseJsonSchema: schema,
+        maxOutputTokens: 4096,
+      },
+    }), signal);
+    let text = '';
+    while (true) {
+      const next = await beforeAbort(iterator.next(), signal);
+      if (next.done) break;
+      text += next.value.text || '';
+      if (text.length > 64_000) throw Object.assign(new Error('번역 결과가 너무 깁니다.'), { status: 502 });
+      if (!sentTranslation && !translation) {
+        const prefix = readTranslationPrefix(text, original);
+        if (prefix) {
+          sentTranslation = true;
+          sendTranslation(prefix, model);
+        }
+      }
+    }
+    const result = JSON.parse(text);
+    if (translation) result.translation = translation;
+    return makeFinalResult(result, original || undefined);
+  }
+  try {
+    return { result: await generate(), model };
+  } catch (error) {
+    error.model = model;
+    if (error.status !== 503 || sentTranslation || signal.aborted) throw error;
+    await delay(500, undefined, { signal });
+    const limitError = reserveTranslation();
+    if (limitError) throw Object.assign(new Error(limitError), { status: 429 });
+    console.warn('[최종 번역 모델 전환]', { from: model, to: FINAL_BACKUP_MODEL, status: 503 });
+    model = FINAL_BACKUP_MODEL;
+    try {
+      return { result: await generate(), model };
+    } catch (backupError) {
+      backupError.model = model;
+      throw backupError;
+    }
+  }
+}
 
 if (!G2_READ_KEY || !G2_WRITE_KEY) {
   console.warn('[경고] G2_READ_KEY 또는 G2_WRITE_KEY가 설정되지 않았습니다.');
@@ -475,6 +617,7 @@ function toWav(pcm) {
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter listening on port ${port}`);
   console.info('[최종 번역 모델]', FINAL_MODEL, '예비 모델', FINAL_BACKUP_MODEL);
+  console.info('[빠른 번역]', '번역 우선 표시 · 60초 · 답변 4개');
 });
 
 const liveSockets = new WebSocketServer({
@@ -504,6 +647,15 @@ liveSockets.on('connection', (client) => {
   let interim = '';
   let translation = '';
   let captionTimer;
+  let protocol = 1;
+  let audioParts = [];
+  let transcriptOverflow = false;
+  let translationOverflow = false;
+  let inputFinished = false;
+  let outputFinished = false;
+  let turnFinished = false;
+  let finishStartedAt;
+  let finalController;
   let deadline = setTimeout(() => end(401, '인증 시간이 초과됐습니다.'), 5_000);
 
   function end(status, error) {
@@ -511,6 +663,8 @@ liveSockets.on('connection', (client) => {
     phase = 'closed';
     clearTimeout(deadline);
     clearTimeout(captionTimer);
+    audioParts = [];
+    finalController?.abort();
     if (ownsSlot && !opening) liveInUse = false;
     liveSession?.close();
 
@@ -522,7 +676,7 @@ liveSockets.on('connection', (client) => {
 
   function sendCaption() {
     captionTimer = undefined;
-    if (phase !== 'captions' || client.readyState !== WebSocket.OPEN) return;
+    if (!['captions', 'draining'].includes(phase) || client.readyState !== WebSocket.OPEN) return;
     client.send(JSON.stringify({
       type: 'caption',
       original: (original + interim).trim().slice(-2_000),
@@ -531,20 +685,107 @@ liveSockets.on('connection', (client) => {
   }
 
   function onLiveMessage({ serverContent }) {
-    if (phase !== 'captions' || !serverContent) return;
+    if (!['captions', 'draining'].includes(phase) || !serverContent) return;
     const input = serverContent.inputTranscription;
     const preview = serverContent.interimInputTranscription;
     const output = serverContent.outputTranscription;
     if (input) {
-      original = (original + (input.text ?? '') + (input.finished ? ' ' : '')).slice(-2_000);
+      original += (input.text ?? '') + (input.finished ? ' ' : '');
+      if (original.length > 12_000) {
+        transcriptOverflow = true;
+        original = original.slice(-12_000);
+      }
       interim = '';
+      inputFinished = input.finished === true;
     }
-    if (typeof preview?.text === 'string') interim = preview.text;
+    if (typeof preview?.text === 'string') {
+      interim = preview.text;
+      if (interim.trim()) inputFinished = false;
+    }
     if (output) {
-      translation = (translation + (output.text ?? '') + (output.finished ? ' ' : '')).slice(-2_000);
+      translation += (output.text ?? '') + (output.finished ? ' ' : '');
+      if (translation.length > 12_000) {
+        translationOverflow = true;
+        translation = translation.slice(-12_000);
+      }
+      outputFinished = output.finished === true;
     }
     if ((input || preview || output) && !captionTimer) {
       captionTimer = setTimeout(sendCaption, 250);
+    }
+    if (phase === 'draining') {
+      if (input || preview || output) turnFinished = false;
+      if (serverContent.turnComplete || serverContent.generationComplete) turnFinished = true;
+    }
+  }
+
+  async function finishTranslation() {
+    if (phase !== 'draining') return;
+    const reuseTranscript = inputFinished && turnFinished && !interim.trim() &&
+      !transcriptOverflow && original.trim().length > 0;
+    const finalOriginal = reuseTranscript ? original.trim() : '';
+    const finalTranslation = reuseTranscript && outputFinished && !translationOverflow
+      ? translation.trim() : '';
+    const pcm = Buffer.concat(audioParts, pcmBytes);
+    audioParts = [];
+    phase = 'finalizing';
+    clearTimeout(deadline);
+    clearTimeout(captionTimer);
+    liveSession?.close();
+    if (ownsSlot) {
+      liveInUse = false;
+      ownsSlot = false;
+    }
+    if (isTranslating) return end(429, '이전 번역 요청이 처리 중입니다.');
+    const limitError = reserveTranslation();
+    if (limitError) return end(429, limitError);
+
+    isTranslating = true;
+    finalController = new AbortController();
+    deadline = setTimeout(() => finalController.abort(), 20_000);
+    const source = finalTranslation ? 'live' : reuseTranscript ? 'text' : 'audio';
+    console.info('[최종 번역 시작]', { source, audioSeconds: pcmBytes / (SAMPLE_RATE * 2) });
+    let status = 200;
+    let model = FINAL_MODEL;
+    client.send(JSON.stringify({ type: 'finalizing', source }));
+    const sendTranslation = (partial, usedModel) => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      model = usedModel;
+      client.send(JSON.stringify({ type: 'translation', ...partial }));
+      console.info('[번역 우선 표시]', {
+        model, source, durationMs: Math.round(performance.now() - finishStartedAt),
+      });
+    };
+    try {
+      if (finalTranslation) {
+        sendTranslation({ original: finalOriginal, translation: finalTranslation }, model);
+      }
+      const output = await streamFinalTranslation(
+        pcm, finalOriginal, finalTranslation, finalController.signal, sendTranslation,
+      );
+      model = output.model;
+      if (phase === 'closed') return;
+      latestText = output.result.text;
+      client.send(JSON.stringify({ type: 'result', ...output.result }));
+    } catch (error) {
+      model = error.model || model;
+      status = finalController.signal.aborted ? 504 : error.status || 500;
+      console.error('[최종 번역 오류]', { model, source, status });
+      const errorMessage = {
+        422: '음성을 인식하지 못했습니다.',
+        429: '번역 요청 한도에 도달했습니다.',
+        503: '번역 서비스가 잠시 혼잡합니다.',
+        504: '추천 답변 처리가 지연됐습니다.',
+      }[status] || '최종 결과를 완성하지 못했습니다.';
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'error', status, error: errorMessage }));
+      }
+    } finally {
+      isTranslating = false;
+      console.info('[최종 번역 응답]', {
+        model, source, status, durationMs: Math.round(performance.now() - finishStartedAt),
+      });
+      end();
     }
   }
 
@@ -562,9 +803,20 @@ liveSockets.on('connection', (client) => {
         },
         callbacks: {
           onmessage: onLiveMessage,
-          onerror: () => end(502, '실시간 번역 연결 오류'),
+          onerror: () => {
+            if (phase === 'finalizing' || phase === 'closed') return;
+            if (phase === 'draining') {
+              inputFinished = false;
+              void finishTranslation();
+            } else end(502, '실시간 번역 연결 오류');
+          },
           onclose: ({ code }) => {
-            if (phase === 'closed') return;
+            if (['closed', 'finalizing'].includes(phase)) return;
+            if (phase === 'draining') {
+              inputFinished = false;
+              void finishTranslation();
+              return;
+            }
             console.warn('[Gemini Live 연결 종료]', code);
             end(502, '실시간 번역 연결이 끊겼습니다.');
           },
@@ -582,7 +834,7 @@ liveSockets.on('connection', (client) => {
         () => end(408, '실시간 자막 시간이 끝났습니다.'),
         (MAX_AUDIO_SECONDS + 5) * 1_000,
       );
-      client.send(JSON.stringify({ type: 'ready' }));
+      client.send(JSON.stringify({ type: 'ready', protocol }));
     } catch (error) {
       if (phase === 'closed') return;
       console.error('[Gemini Live 연결 오류]', { model: LIVE_MODEL, name: error.name, status: error.status });
@@ -607,12 +859,36 @@ liveSockets.on('connection', (client) => {
       const limitError = reserveLiveSession();
       if (limitError) return end(429, limitError);
 
+      protocol = auth.protocol === 2 ? 2 : 1;
+
       ownsSlot = true;
       liveInUse = true;
       phase = 'connecting';
       clearTimeout(deadline);
       deadline = setTimeout(() => end(504, '실시간 자막 연결이 늦어졌습니다.'), 6_000);
       void connectLive();
+      return;
+    }
+
+    if (phase === 'captions' && protocol === 2 && !isBinary) {
+      let command;
+      try { command = JSON.parse(data.toString()); } catch { /* 아래에서 거절 */ }
+      if (command?.type !== 'finish' || command.bytes !== pcmBytes || pcmBytes < 3_200) {
+        return end(400, '마지막 음성 데이터가 일치하지 않습니다.');
+      }
+      phase = 'draining';
+      finishStartedAt = performance.now();
+      inputFinished = false;
+      outputFinished = false;
+      turnFinished = false;
+      clearTimeout(deadline);
+      // 종료 뒤 확인된 원문만 재사용하고, 확인이 늦으면 받은 음성 전체를 처리합니다.
+      deadline = setTimeout(() => void finishTranslation(), 1_200);
+      try {
+        liveSession.sendRealtimeInput({ audioStreamEnd: true });
+      } catch {
+        void finishTranslation();
+      }
       return;
     }
 
@@ -625,6 +901,7 @@ liveSockets.on('connection', (client) => {
     if (pcmBytes > MAX_AUDIO_BYTES) {
       return end(413, `${MAX_AUDIO_SECONDS}초 녹음 한도를 초과했습니다.`);
     }
+    if (protocol === 2) audioParts.push(Buffer.from(data));
 
     try {
       liveSession.sendRealtimeInput({
