@@ -22,6 +22,8 @@ const FINAL_MODEL = FINAL_MODEL_OPTIONS.includes(configuredFinalModel)
   ? configuredFinalModel : FINAL_MODEL_OPTIONS[0];
 const FINAL_BACKUP_MODEL = FINAL_MODEL_OPTIONS.find((model) => model !== FINAL_MODEL);
 const AUDIO_FINAL_MODEL = FINAL_MODEL_OPTIONS[0];
+// 비교 중에는 선택 모델로 고정합니다. 명시적으로 true를 설정한 경우에만 자동 전환합니다.
+const ALLOW_FINAL_FALLBACK = process.env.G2_FINAL_FALLBACK?.trim().toLowerCase() === 'true';
 if (configuredFinalModel && configuredFinalModel !== FINAL_MODEL) {
   console.warn('[최종 모델 설정 확인]', 'GEMINI_FINAL_MODEL은 3.5 또는 3.1 Flash-Lite만 지원합니다. 기본 모델을 사용합니다.');
 }
@@ -33,11 +35,33 @@ const finalCache = new Map();
 const modelBusyUntil = new Map();
 let finalAI;
 
+async function timedGeminiFetch(input, init) {
+  const startedAt = performance.now();
+  const requestUrl = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+  // URL·헤더·요청 본문을 기록하지 않고 모델명만 추출합니다.
+  const model = requestUrl?.match(/\/models\/([A-Za-z0-9._-]+)/)?.[1] || 'unknown';
+  try {
+    const response = await fetch(input, init);
+    console.info('[Gemini HTTP 수신]', {
+      model, status: response.status,
+      headersMs: Math.round(performance.now() - startedAt),
+      contentType: response.headers.get('content-type'),
+    });
+    return response;
+  } catch (error) {
+    console.warn('[Gemini HTTP 수신 실패]', {
+      model, headersMs: Math.round(performance.now() - startedAt),
+      name: error.name, aborted: init?.signal?.aborted === true,
+    });
+    throw error;
+  }
+}
+
 function getFinalAI() {
   // SDK 내부 재시도는 끄고, 아래의 최대 2회 호출 한도로 관리합니다.
   return finalAI ??= new GoogleGenAI({
     apiKey: GEMINI_API_KEY,
-    httpOptions: { retryOptions: { attempts: 1 } },
+    httpOptions: { retryOptions: { attempts: 1 }, fetch: timedGeminiFetch },
   });
 }
 
@@ -71,6 +95,7 @@ function setFinalCache(original, translation, output) {
 }
 
 function availableFinalModels(preferredModel) {
+  if (!ALLOW_FINAL_FALLBACK) return [preferredModel];
   const models = [preferredModel, ...FINAL_MODEL_OPTIONS.filter((model) => model !== preferredModel)];
   const available = models.filter((model) => (modelBusyUntil.get(model) || 0) <= Date.now());
   // 두 모델 모두 혼잡했으면 이번 요청에서는 더 오래 전에 실패한 모델만 확인합니다.
@@ -651,7 +676,7 @@ app.post(
       try {
         response = await translate();
       } catch (error) {
-        if (!liveFinal || error.status !== 503 || signal.aborted) throw error;
+        if (!liveFinal || !ALLOW_FINAL_FALLBACK || error.status !== 503 || signal.aborted) throw error;
 
         // 한 번만 전환하고, 두 모델에 같은 마감 시간과 호출 한도를 적용합니다.
         await delay(100, undefined, { signal });
@@ -727,9 +752,11 @@ function toWav(pcm) {
 
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter listening on port ${port}`);
-  console.info('[최종 번역 모델]', FINAL_MODEL, '예비 모델', FINAL_BACKUP_MODEL);
+  console.info('[최종 번역 모델]', FINAL_MODEL,
+    ...(ALLOW_FINAL_FALLBACK ? ['예비 모델', FINAL_BACKUP_MODEL] : ['(고정)']));
   console.info('[음성 재처리 모델]', AUDIO_FINAL_MODEL);
-  console.info('[빠른 번역]', `Gemini 전용 v6 · 모델 선택 지원 · 60초 · 답변 ${REPLY_COUNT}개`);
+  console.info('[모델 자동 전환]', ALLOW_FINAL_FALLBACK ? '켜짐' : '꺼짐 (선택 모델 고정)');
+  console.info('[빠른 번역]', `Gemini 전용 v7 · 실제 모델 고정 · 60초 · 답변 ${REPLY_COUNT}개`);
 });
 
 const liveSockets = new WebSocketServer({
@@ -911,7 +938,8 @@ liveSockets.on('connection', (client) => {
       model = usedModel;
       client.send(JSON.stringify({ type: 'translation', ...partial }));
       console.info('[번역 우선 표시]', {
-        model, source, durationMs: Math.round(performance.now() - finishStartedAt),
+        model: source === 'live' ? LIVE_MODEL : usedModel,
+        source, durationMs: Math.round(performance.now() - finishStartedAt),
       });
     };
     const generate = () => streamFinalTranslation(
