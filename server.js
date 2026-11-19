@@ -172,7 +172,7 @@ function replyTimeout(stage) {
   });
 }
 
-async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation, takeAttempt, progressDeadline = false) {
+async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation, takeAttempt, progressDeadline = false, allowFallback = true) {
   const cached = getFinalCache(original, translation);
   if (cached) {
     if (!translation) sendTranslation({ original, translation: cached.result.translation }, cached.model);
@@ -215,7 +215,7 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
   const ai = getFinalAI();
   let sentTranslation = false;
   const preferredModel = original ? FINAL_MODEL : AUDIO_FINAL_MODEL;
-  const models = availableFinalModels(preferredModel);
+  const models = allowFallback ? availableFinalModels(preferredModel) : [preferredModel];
   let model = models[0];
   if (model !== preferredModel) console.info('[혼잡 모델 임시 우회]', { model });
   async function generate() {
@@ -554,6 +554,7 @@ app.post('/push-translation', authenticate('write'), express.json({ limit: '10kb
 
 // [보안 번역] 인증 ➔ 파싱 ➔ 입력/설정 검증 ➔ 한도 집계 ➔ Gemini 호출
 const parseText = express.json({ limit: '10kb' });
+const parseReplyRetry = express.json({ limit: '80kb' });
 const parseAudio = express.raw({
   type: 'application/octet-stream',
   limit: MAX_AUDIO_BYTES,
@@ -576,6 +577,73 @@ async function generateBeforeDeadline(ai, request, signal) {
     signal.removeEventListener('abort', onAbort);
   }
 }
+
+// [보안 재요청] 녹음 없이 저장된 질문의 추천 답변만 다시 받습니다.
+app.post('/retry-replies', authenticate('audio'), parseReplyRetry, async (req, res) => {
+  const { original, translation } = req.body ?? {};
+  if (typeof original !== 'string' || !original.trim() ||
+      typeof translation !== 'string' || !translation.trim() ||
+      original.length > 12_000 || translation.length > 12_000) {
+    return res.status(400).json({ stage: 'validation', error: '저장된 원문과 번역을 확인해 주세요.' });
+  }
+  if (!GEMINI_API_KEY) {
+    return res.status(503).json({ stage: 'configuration', error: 'Gemini API 키가 설정되지 않았습니다.' });
+  }
+  if (isTranslating) {
+    return res.status(429).json({ stage: 'suggestions', error: '이전 요청이 처리 중입니다. 잠시 후 다시 시도하세요.' });
+  }
+
+  isTranslating = true;
+  res.setHeader('Cache-Control', 'no-store');
+  const controller = new AbortController();
+  const onDisconnect = () => { if (!res.writableEnded) controller.abort(); };
+  res.once('close', onDisconnect);
+  const deadline = setTimeout(() => controller.abort(replyTimeout('total')), 8_000);
+  const startedAt = performance.now();
+  let status = 200;
+  let attempts = 0;
+  let model = FINAL_MODEL;
+  let cacheHit = false;
+  try {
+    console.info('[답변 다시 받기 시작]', { model, transcriptChars: original.trim().length });
+    const takeAttempt = () => {
+      if (attempts >= 1) throw Object.assign(new Error('재요청은 한 번씩만 실행할 수 있습니다.'), { status: 429 });
+      const error = reserveTranslation();
+      if (error) throw Object.assign(new Error(error), { status: 429 });
+      attempts++;
+    };
+    const output = await streamFinalTranslation(
+      null, original.trim(), translation.trim(), controller.signal, () => {}, takeAttempt, true, false,
+    );
+    controller.signal.throwIfAborted();
+    model = output.model;
+    cacheHit = output.cacheHit === true;
+    setFinalCache(original.trim(), translation.trim(), output);
+    if (res.destroyed || res.writableEnded) return;
+    latestText = output.result.text;
+    return res.status(200).json({ ...output.result, cacheHit });
+  } catch (error) {
+    model = error.model || model;
+    status = res.destroyed ? 499 : controller.signal.aborted ? 504 : error.status || 500;
+    console[status === 499 ? 'info' : 'warn']('[답변 다시 받기 중단]', {
+      model, status, timeoutStage: error.timeoutStage || controller.signal.reason?.timeoutStage || null,
+    });
+    if (res.destroyed || res.writableEnded) return;
+    const message = {
+      429: '요청 한도에 도달했거나 다른 요청이 처리 중입니다.',
+      503: '답변 서비스가 잠시 혼잡합니다. 번역은 유지됩니다.',
+      504: '답변 응답 시간이 초과됐습니다. 번역은 유지됩니다.',
+    }[status] || '추천 답변을 받지 못했습니다. 번역은 유지됩니다.';
+    return res.status(status).json({ stage: 'suggestions', error: message });
+  } finally {
+    clearTimeout(deadline);
+    res.off('close', onDisconnect);
+    isTranslating = false;
+    console.info('[답변 다시 받기 응답]', {
+      model, status, attempts, cacheHit, durationMs: Math.round(performance.now() - startedAt),
+    });
+  }
+});
 
 app.post(
   ['/translate', '/translate-audio'],
@@ -790,7 +858,7 @@ const server = app.listen(port, '0.0.0.0', () => {
     ...(ALLOW_FINAL_FALLBACK ? ['예비 모델', FINAL_BACKUP_MODEL] : ['(고정)']));
   console.info('[음성 재처리 모델]', AUDIO_FINAL_MODEL);
   console.info('[모델 자동 전환]', ALLOW_FINAL_FALLBACK ? '켜짐' : '꺼짐 (선택 모델 고정)');
-  console.info('[빠른 번역]', `Gemini 전용 v9 · 첫 응답·생성 중 제한 분리 · 60초 · 답변 ${REPLY_COUNT}개`);
+  console.info('[빠른 번역]', `Gemini 전용 v10 · 답변 다시 받기 지원 · 60초 · 답변 ${REPLY_COUNT}개`);
 });
 
 const liveSockets = new WebSocketServer({
