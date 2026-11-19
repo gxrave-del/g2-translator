@@ -617,7 +617,7 @@ function toWav(pcm) {
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter listening on port ${port}`);
   console.info('[최종 번역 모델]', FINAL_MODEL, '예비 모델', FINAL_BACKUP_MODEL);
-  console.info('[빠른 번역]', '번역 우선 표시 · 60초 · 답변 4개');
+  console.info('[빠른 번역]', '원문 재사용 수정 v2 · 60초 · 답변 4개');
 });
 
 const liveSockets = new WebSocketServer({
@@ -652,8 +652,10 @@ liveSockets.on('connection', (client) => {
   let transcriptOverflow = false;
   let translationOverflow = false;
   let inputFinished = false;
+  let inputConfirmedBytes = 0;
   let outputFinished = false;
-  let turnFinished = false;
+  let outputConfirmedBytes = 0;
+  let drainCheckTimer;
   let finishStartedAt;
   let finalController;
   let deadline = setTimeout(() => end(401, '인증 시간이 초과됐습니다.'), 5_000);
@@ -663,6 +665,7 @@ liveSockets.on('connection', (client) => {
     phase = 'closed';
     clearTimeout(deadline);
     clearTimeout(captionTimer);
+    clearTimeout(drainCheckTimer);
     audioParts = [];
     finalController?.abort();
     if (ownsSlot && !opening) liveInUse = false;
@@ -696,7 +699,10 @@ liveSockets.on('connection', (client) => {
         original = original.slice(-12_000);
       }
       interim = '';
-      inputFinished = input.finished === true;
+      if (input.text || typeof input.finished === 'boolean') {
+        inputFinished = input.finished === true;
+      }
+      if (input.finished === true) inputConfirmedBytes = pcmBytes;
     }
     if (typeof preview?.text === 'string') {
       interim = preview.text;
@@ -708,29 +714,42 @@ liveSockets.on('connection', (client) => {
         translationOverflow = true;
         translation = translation.slice(-12_000);
       }
-      outputFinished = output.finished === true;
+      if (output.text || typeof output.finished === 'boolean') {
+        outputFinished = output.finished === true;
+      }
+      if (output.finished === true) outputConfirmedBytes = pcmBytes;
     }
     if ((input || preview || output) && !captionTimer) {
       captionTimer = setTimeout(sendCaption, 250);
     }
-    if (phase === 'draining') {
-      if (input || preview || output) turnFinished = false;
-      if (serverContent.turnComplete || serverContent.generationComplete) turnFinished = true;
-    }
+    if (phase === 'draining' && (input || preview || output)) scheduleFinalCheck();
+  }
+
+  function hasFinalOriginal() {
+    return inputFinished && inputConfirmedBytes === pcmBytes && !interim.trim() &&
+      !transcriptOverflow && original.trim().length > 0;
+  }
+
+  function scheduleFinalCheck() {
+    clearTimeout(drainCheckTimer);
+    if (phase !== 'draining' || !hasFinalOriginal()) return;
+    // 마지막 단어가 늦게 도착할 여유를 두고, 원문이 완성되면 전체 대기를 끝냅니다.
+    const quietWait = Math.max(250, 800 - (performance.now() - finishStartedAt));
+    drainCheckTimer = setTimeout(() => void finishTranslation(), quietWait);
   }
 
   async function finishTranslation() {
     if (phase !== 'draining') return;
-    const reuseTranscript = inputFinished && turnFinished && !interim.trim() &&
-      !transcriptOverflow && original.trim().length > 0;
+    const reuseTranscript = hasFinalOriginal();
     const finalOriginal = reuseTranscript ? original.trim() : '';
-    const finalTranslation = reuseTranscript && outputFinished && !translationOverflow
+    const finalTranslation = reuseTranscript && outputFinished && outputConfirmedBytes === pcmBytes && !translationOverflow
       ? translation.trim() : '';
     const pcm = Buffer.concat(audioParts, pcmBytes);
     audioParts = [];
     phase = 'finalizing';
     clearTimeout(deadline);
     clearTimeout(captionTimer);
+    clearTimeout(drainCheckTimer);
     liveSession?.close();
     if (ownsSlot) {
       liveInUse = false;
@@ -744,7 +763,14 @@ liveSockets.on('connection', (client) => {
     finalController = new AbortController();
     deadline = setTimeout(() => finalController.abort(), 20_000);
     const source = finalTranslation ? 'live' : reuseTranscript ? 'text' : 'audio';
-    console.info('[최종 번역 시작]', { source, audioSeconds: pcmBytes / (SAMPLE_RATE * 2) });
+    console.info('[최종 번역 시작]', {
+      source, audioSeconds: pcmBytes / (SAMPLE_RATE * 2),
+      transcriptChars: original.trim().length,
+      inputFinished, audioAfterInputEndBytes: pcmBytes - inputConfirmedBytes,
+      outputFinished, audioAfterOutputEndBytes: pcmBytes - outputConfirmedBytes,
+      interimChars: interim.trim().length,
+      transcriptOverflow, translationOverflow,
+    });
     let status = 200;
     let model = FINAL_MODEL;
     client.send(JSON.stringify({ type: 'finalizing', source }));
@@ -878,12 +904,10 @@ liveSockets.on('connection', (client) => {
       }
       phase = 'draining';
       finishStartedAt = performance.now();
-      inputFinished = false;
-      outputFinished = false;
-      turnFinished = false;
       clearTimeout(deadline);
-      // 종료 뒤 확인된 원문만 재사용하고, 확인이 늦으면 받은 음성 전체를 처리합니다.
-      deadline = setTimeout(() => void finishTranslation(), 1_200);
+      // 완료된 인식 상태를 보존합니다. 후속 음성 유무와 미확정 원문은 재사용 전 확인합니다.
+      deadline = setTimeout(() => void finishTranslation(), 2_400);
+      scheduleFinalCheck();
       try {
         liveSession.sendRealtimeInput({ audioStreamEnd: true });
       } catch {
