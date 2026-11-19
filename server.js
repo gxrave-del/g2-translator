@@ -18,11 +18,62 @@ const LIVE_CHUNK_BYTES = SAMPLE_RATE * 2 / 10;
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL?.trim() || 'gemini-3.5-live-translate-preview';
 const FINAL_MODEL = 'gemini-3.5-flash-lite';
 const FINAL_BACKUP_MODEL = 'gemini-3.1-flash-lite';
+const FINAL_CACHE_TTL_MS = 5 * 60_000;
+const FINAL_CACHE_MAX_ITEMS = 64;
+const finalCache = new Map();
+const modelBusyUntil = new Map();
+let finalAI;
+
+function getFinalAI() {
+  // SDK 내부 재시도는 끄고, 아래의 최대 2회 호출 한도로 관리합니다.
+  return finalAI ??= new GoogleGenAI({
+    apiKey: GEMINI_API_KEY,
+    httpOptions: { retryOptions: { attempts: 1 } },
+  });
+}
+
+function finalCacheKey(original, translation) {
+  if (!original || original.length > 300) return null;
+  return JSON.stringify([original, translation]);
+}
+
+function getFinalCache(original, translation) {
+  const key = finalCacheKey(original, translation);
+  const entry = key && finalCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.savedAt >= FINAL_CACHE_TTL_MS) {
+    finalCache.delete(key);
+    return null;
+  }
+  finalCache.delete(key);
+  finalCache.set(key, entry);
+  return { result: structuredClone(entry.result), model: entry.model, cacheHit: true };
+}
+
+function setFinalCache(original, translation, output) {
+  const key = finalCacheKey(original, translation);
+  if (!key || (translation && translation !== output.result.translation)) return;
+  for (const [oldKey, entry] of finalCache) {
+    if (Date.now() - entry.savedAt >= FINAL_CACHE_TTL_MS) finalCache.delete(oldKey);
+  }
+  finalCache.delete(key);
+  finalCache.set(key, { savedAt: Date.now(), model: output.model, result: structuredClone(output.result) });
+  while (finalCache.size > FINAL_CACHE_MAX_ITEMS) finalCache.delete(finalCache.keys().next().value);
+}
+
+function availableFinalModels() {
+  const models = [FINAL_MODEL, FINAL_BACKUP_MODEL];
+  const available = models.filter((model) => (modelBusyUntil.get(model) || 0) <= Date.now());
+  // 두 모델 모두 혼잡했으면 이번 요청에서는 더 오래 전에 실패한 모델만 확인합니다.
+  return available.length ? available : [models.sort((a, b) => modelBusyUntil.get(a) - modelBusyUntil.get(b))[0]];
+}
+
 const REPLY_LABELS = ['긍정', '거절·대안', '역질문', '위트'];
 const REPLY_INSTRUCTIONS = [
   '상대에게 바로 말할 수 있는 답변을 4개 만드세요.',
   '1번 긍정·수락, 2번 정중한 거절·대안, 3번 상황을 확인하는 역질문, 4번 가볍고 재치 있는 위트 순서입니다.',
   'reply는 상대의 언어로 짧은 한 문장, pronunciation은 한글 발음, meaning은 한국어 뜻입니다.',
+  '답변은 가능하면 8단어 안팎으로 쓰고, 발음과 뜻은 그 문장에 해당하는 내용만 적으세요. 위트도 짧게 쓰세요.',
   '숫자, 장소, 부정 표현을 보존하고 사실을 지어내지 마세요.',
 ];
 
@@ -78,6 +129,12 @@ async function beforeAbort(promise, signal) {
 }
 
 async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation, takeAttempt) {
+  const cached = getFinalCache(original, translation);
+  if (cached) {
+    if (!translation) sendTranslation({ original, translation: cached.result.translation }, cached.model);
+    console.info('[답변 재사용]', { model: cached.model, transcriptChars: original.length });
+    return cached;
+  }
   const instructions = [
     translation
       ? '아래 발화 원문과 한국어 번역을 바탕으로 suggestions만 작성하세요.'
@@ -111,51 +168,86 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
     required: translation ? ['suggestions'] : original ? ['translation', 'suggestions'] : ['original', 'translation', 'suggestions'],
     propertyOrdering: translation ? ['suggestions'] : original ? ['translation', 'suggestions'] : ['original', 'translation', 'suggestions'],
   };
-  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  const ai = getFinalAI();
   let sentTranslation = false;
-  let model = FINAL_MODEL;
+  const models = availableFinalModels();
+  let model = models[0];
+  if (model !== FINAL_MODEL) console.info('[혼잡 모델 임시 우회]', { model });
   async function generate() {
     takeAttempt();
-    const iterator = await beforeAbort(ai.models.generateContentStream({
-      model, contents,
-      config: {
-        abortSignal: signal,
-        automaticContinuation: false,
-        thinkingConfig: { thinkingLevel: 'MINIMAL' },
-        responseMimeType: 'application/json', responseJsonSchema: schema,
-        maxOutputTokens: 4096,
-      },
-    }), signal);
+    const controller = new AbortController();
+    const requestSignal = AbortSignal.any([signal, controller.signal]);
+    const startedAt = performance.now();
+    let firstTokenMs = null;
+    let iterator;
     let text = '';
-    while (true) {
-      const next = await beforeAbort(iterator.next(), signal);
-      if (next.done) break;
-      text += next.value.text || '';
-      if (text.length > 64_000) throw Object.assign(new Error('번역 결과가 너무 깁니다.'), { status: 502 });
-      if (!sentTranslation && !translation) {
-        const prefix = readTranslationPrefix(text, original);
-        if (prefix) {
-          sentTranslation = true;
-          sendTranslation(prefix, model);
+    let completed = false;
+    try {
+      iterator = await beforeAbort(ai.models.generateContentStream({
+        model, contents,
+        config: {
+          abortSignal: requestSignal,
+          automaticContinuation: false,
+          thinkingConfig: { thinkingLevel: 'MINIMAL' },
+          responseMimeType: 'application/json', responseJsonSchema: schema,
+          maxOutputTokens: translation ? 2048 : original ? 3072 : 4096,
+        },
+      }), requestSignal);
+      while (true) {
+        const next = await beforeAbort(iterator.next(), requestSignal);
+        if (next.done) break;
+        const delta = next.value.text || '';
+        if (delta && firstTokenMs === null) firstTokenMs = Math.round(performance.now() - startedAt);
+        text += delta;
+        if (text.length > 64_000) throw Object.assign(new Error('번역 결과가 너무 깁니다.'), { status: 502 });
+        if (!sentTranslation && !translation) {
+          const prefix = readTranslationPrefix(text, original);
+          if (prefix) {
+            sentTranslation = true;
+            sendTranslation(prefix, model);
+          }
+        }
+        const finishReason = next.value.candidates?.[0]?.finishReason;
+        if (finishReason && finishReason !== 'STOP') {
+          throw Object.assign(new Error('추천 답변 생성을 완료하지 못했습니다.'), { status: 502 });
+        }
+        // 완성된 JSON은 스트림의 추가 종료 신호를 기다리지 않고 검증해 전달합니다.
+        if (text.trimEnd().endsWith('}')) {
+          let parsed;
+          try { parsed = JSON.parse(text); } catch { /* 다음 조각을 기다립니다. */ }
+          if (parsed && typeof parsed === 'object') {
+            if (translation) parsed.translation = translation;
+            const result = makeFinalResult(parsed, original || undefined);
+            completed = true;
+            modelBusyUntil.delete(model);
+            return result;
+          }
         }
       }
+      throw Object.assign(new Error('추천 답변 결과가 완성되지 않았습니다.'), { status: 502 });
+    } finally {
+      console.info('[답변 생성 시간]', {
+        model, firstTokenMs, durationMs: Math.round(performance.now() - startedAt),
+        outputChars: text.length, completed,
+      });
+      controller.abort();
+      try { iterator?.return?.().catch(() => {}); } catch { /* 이미 종료된 스트림 */ }
     }
-    const result = JSON.parse(text);
-    if (translation) result.translation = translation;
-    return makeFinalResult(result, original || undefined);
   }
   try {
     return { result: await generate(), model };
   } catch (error) {
     error.model = model;
-    if (error.status !== 503 || sentTranslation || signal.aborted) throw error;
-    await delay(500, undefined, { signal });
-    console.warn('[최종 번역 모델 전환]', { from: model, to: FINAL_BACKUP_MODEL, status: 503 });
-    model = FINAL_BACKUP_MODEL;
+    if (error.status === 503) modelBusyUntil.set(model, Date.now() + 30_000);
+    if (error.status !== 503 || sentTranslation || signal.aborted || models.length < 2) throw error;
+    await delay(100, undefined, { signal });
+    console.warn('[최종 번역 모델 전환]', { from: model, to: models[1], status: 503 });
+    model = models[1];
     try {
       return { result: await generate(), model };
     } catch (backupError) {
       backupError.model = model;
+      if (backupError.status === 503) modelBusyUntil.set(model, Date.now() + 30_000);
       throw backupError;
     }
   }
@@ -469,7 +561,7 @@ app.post(
     }
 
     try {
-      const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+      const ai = getFinalAI();
       const { targetLang = 'ko' } = req.body ?? {};
       const language = targetLang === 'ko' ? '한국어' : '영어';
 
@@ -543,7 +635,7 @@ app.post(
         if (!liveFinal || error.status !== 503 || signal.aborted) throw error;
 
         // 한 번만 전환하고, 두 모델에 같은 마감 시간과 호출 한도를 적용합니다.
-        await delay(500, undefined, { signal });
+        await delay(100, undefined, { signal });
         const backupLimitError = reserveTranslation();
         if (backupLimitError) return res.status(429).json({ error: backupLimitError });
 
@@ -616,7 +708,7 @@ function toWav(pcm) {
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter listening on port ${port}`);
   console.info('[최종 번역 모델]', FINAL_MODEL, '예비 모델', FINAL_BACKUP_MODEL);
-  console.info('[빠른 번역]', '연속 원문 처리 v3 · 60초 · 답변 4개');
+  console.info('[빠른 번역]', 'Gemini 전용 v5 · 완성 즉시 전달 · 60초 · 답변 4개');
 });
 
 const liveSockets = new WebSocketServer({
@@ -751,12 +843,7 @@ liveSockets.on('connection', (client) => {
     if (phase !== 'draining' || !hasUsableOriginal()) return;
     // 연속 번역에는 finished 필드가 생략될 수 있습니다. 종료 뒤 텍스트 안정 시간을 확인합니다.
     const now = performance.now();
-    const quietWait = Math.max(
-      0,
-      400 - (now - lastInputAt),
-      400 - (now - lastOutputAt),
-      1_000 - (now - finishStartedAt),
-    );
+    const quietWait = Math.max(0, 400 - (now - lastInputAt), 400 - (now - lastOutputAt), 1_000 - (now - finishStartedAt));
     drainCheckTimer = setTimeout(() => void finishTranslation(), quietWait);
   }
 
@@ -770,9 +857,6 @@ liveSockets.on('connection', (client) => {
     clearTimeout(captionTimer);
     clearTimeout(drainCheckTimer);
     if (isTranslating) return end(429, '이전 번역 요청이 처리 중입니다.');
-    const limitError = reserveTranslation();
-    if (limitError) return end(429, limitError);
-
     isTranslating = true;
     finalController = new AbortController();
     deadline = setTimeout(() => finalController.abort(), 20_000);
@@ -785,19 +869,18 @@ liveSockets.on('connection', (client) => {
       interimChars: interim.trim().length,
       translationChars: translation.trim().length,
       transcriptAgeMs: Number.isFinite(lastInputAt) ? Math.round(performance.now() - lastInputAt) : null,
-      transcriptOverflow, translationOverflow, liveFailed,
+      transcriptOverflow, translationOverflow,
     });
     let status = 200;
     let model = FINAL_MODEL;
     let attempts = 0;
+    let cacheHit = false;
     const takeAttempt = () => {
       if (attempts >= 2) {
         throw Object.assign(new Error('마지막 발화가 계속 갱신되고 있습니다.'), { status: 409 });
       }
-      if (attempts > 0) {
-        const error = reserveTranslation();
-        if (error) throw Object.assign(new Error(error), { status: 429 });
-      }
+      const error = reserveTranslation();
+      if (error) throw Object.assign(new Error(error), { status: 429 });
       attempts++;
     };
     client.send(JSON.stringify({ type: 'finalizing', source }));
@@ -819,7 +902,12 @@ liveSockets.on('connection', (client) => {
       }
       let output = await generate();
       model = output.model;
+      cacheHit = output.cacheHit === true;
       if (phase === 'closed') return;
+
+      // 즉시 끝난 결과나 재사용 결과도 말끝 수신을 잠시 더 확인합니다.
+      const tailWait = 1_400 - (performance.now() - finishStartedAt);
+      if (tailWait > 0) await delay(tailWait, undefined, { signal: finalController.signal });
 
       // 생성 중에도 Live 입력을 받아 뒤늦게 온 말끝을 버리지 않습니다.
       if (snapshot.original && (liveFailed || interim.trim() || snapshot.original !== original.trim())) {
@@ -833,6 +921,7 @@ liveSockets.on('connection', (client) => {
         if (snapshot.translation) sendTranslation(snapshot, model);
         output = await generate();
         model = output.model;
+        cacheHit = output.cacheHit === true;
         if (phase === 'closed') return;
         if (snapshot.original && (liveFailed || interim.trim() || snapshot.original !== original.trim())) {
           throw Object.assign(new Error('마지막 발화가 계속 갱신되고 있습니다.'), { status: 409 });
@@ -845,6 +934,7 @@ liveSockets.on('connection', (client) => {
           sendTranslation(latest, model);
         }
       }
+      setFinalCache(snapshot.original, snapshot.translation, output);
       latestText = output.result.text;
       client.send(JSON.stringify({ type: 'result', ...output.result }));
     } catch (error) {
@@ -864,7 +954,8 @@ liveSockets.on('connection', (client) => {
     } finally {
       isTranslating = false;
       console.info('[최종 번역 응답]', {
-        model, source, status, durationMs: Math.round(performance.now() - finishStartedAt),
+        model, source, status, attempts, cacheHit,
+        durationMs: Math.round(performance.now() - finishStartedAt),
       });
       end();
     }
@@ -970,7 +1061,6 @@ liveSockets.on('connection', (client) => {
       try {
         liveSession.sendRealtimeInput({ audioStreamEnd: true });
       } catch {
-        liveFailed = true;
         void finishTranslation();
       }
       return;
