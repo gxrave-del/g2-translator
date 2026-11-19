@@ -166,7 +166,13 @@ async function beforeAbort(promise, signal) {
   }
 }
 
-async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation, takeAttempt) {
+function replyTimeout(stage) {
+  return Object.assign(new Error('추천 답변 응답 시간이 초과됐습니다.'), {
+    name: 'TimeoutError', status: 504, timeoutStage: stage,
+  });
+}
+
+async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation, takeAttempt, progressDeadline = false) {
   const cached = getFinalCache(original, translation);
   if (cached) {
     if (!translation) sendTranslation({ original, translation: cached.result.translation }, cached.model);
@@ -223,8 +229,16 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
     let iterator;
     let text = '';
     let completed = false;
+    let progressTimer;
+    let lastTextAt = null;
+    const armProgressDeadline = (milliseconds, stage) => {
+      clearTimeout(progressTimer);
+      progressTimer = setTimeout(() => controller.abort(replyTimeout(stage)), milliseconds);
+    };
     try {
       console.info('[답변 요청 시작]', { model, replyCount: REPLY_COUNT, source: original ? 'text' : 'audio' });
+      // HTTP 헤더나 빈 SSE 조각은 실제 답변이 아닙니다. 첫 글자를 기준으로 구분합니다.
+      if (progressDeadline) armProgressDeadline(5_000, 'first_text');
       iterator = await beforeAbort(ai.models.generateContentStream({
         model, contents,
         config: {
@@ -239,10 +253,15 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
         const next = await beforeAbort(iterator.next(), requestSignal);
         if (next.done) break;
         const delta = next.value.text || '';
-        if (delta && firstTokenMs === null) {
-          firstTokenMs = Math.round(performance.now() - startedAt);
-          firstChunkChars = delta.length;
-          console.info('[답변 첫 응답]', { model, firstTokenMs, firstChunkChars });
+        if (delta.trim()) {
+          lastTextAt = performance.now();
+          if (firstTokenMs === null) {
+            firstTokenMs = Math.round(lastTextAt - startedAt);
+            firstChunkChars = delta.length;
+            console.info('[답변 첫 응답]', { model, firstTokenMs, firstChunkChars });
+          }
+          // 글자가 계속 오면 완료를 허용하고, 생성 도중 멎으면 따로 중단합니다.
+          if (progressDeadline) armProgressDeadline(3_000, 'stream_stall');
         }
         if (Number.isFinite(next.value.usageMetadata?.thoughtsTokenCount)) {
           thoughtsTokenCount = next.value.usageMetadata.thoughtsTokenCount;
@@ -274,11 +293,18 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
         }
       }
       throw Object.assign(new Error('추천 답변 결과가 완성되지 않았습니다.'), { status: 502 });
+    } catch (error) {
+      // SDK가 AbortError로 바꾸어도 중단 사유와 504 상태를 보존합니다.
+      if (requestSignal.aborted) throw requestSignal.reason;
+      throw error;
     } finally {
+      clearTimeout(progressTimer);
       console.info('[답변 생성 시간]', {
         model, replyCount: REPLY_COUNT, firstTokenMs, firstChunkChars,
         durationMs: Math.round(performance.now() - startedAt),
         outputChars: text.length, thoughtsTokenCount, completed,
+        lastTextAgeMs: lastTextAt === null ? null : Math.round(performance.now() - lastTextAt),
+        timeoutStage: requestSignal.aborted ? requestSignal.reason?.timeoutStage ?? null : null,
       });
       controller.abort();
       try { iterator?.return?.().catch(() => {}); } catch { /* 이미 종료된 스트림 */ }
@@ -764,7 +790,7 @@ const server = app.listen(port, '0.0.0.0', () => {
     ...(ALLOW_FINAL_FALLBACK ? ['예비 모델', FINAL_BACKUP_MODEL] : ['(고정)']));
   console.info('[음성 재처리 모델]', AUDIO_FINAL_MODEL);
   console.info('[모델 자동 전환]', ALLOW_FINAL_FALLBACK ? '켜짐' : '꺼짐 (선택 모델 고정)');
-  console.info('[빠른 번역]', `Gemini 전용 v8 · 다음 듣기 전환 지원 · 60초 · 답변 ${REPLY_COUNT}개`);
+  console.info('[빠른 번역]', `Gemini 전용 v9 · 첫 응답·생성 중 제한 분리 · 60초 · 답변 ${REPLY_COUNT}개`);
 });
 
 const liveSockets = new WebSocketServer({
@@ -944,9 +970,11 @@ liveSockets.on('connection', (client) => {
     isTranslating = true;
     finalController = new AbortController();
     let source = snapshot.translation ? 'live' : snapshot.original ? 'text' : 'audio';
-    // 이미 번역을 받은 새 앱은 추천 답변 때문에 20초를 기다리지 않습니다.
-    const finalWaitMs = protocol === 3 && source === 'live' ? 5_000 : 20_000;
-    deadline = setTimeout(() => finalController.abort(), finalWaitMs);
+    // 번역을 받은 새 앱: 첫 글자 5초, 생성 중 멈춤 3초, 전체 최대 8초로 구분합니다.
+    // 글자를 받는 도중 5초가 됐다는 이유만으로 정상 생성을 끊지 않습니다.
+    const progressDeadline = protocol === 3 && source === 'live';
+    const finalWaitMs = progressDeadline ? 8_000 : 20_000;
+    deadline = setTimeout(() => finalController.abort(replyTimeout('total')), finalWaitMs);
     console.info('[최종 번역 시작]', {
       source, audioSeconds: pcmBytes / (SAMPLE_RATE * 2),
       transcriptChars: original.trim().length,
@@ -993,6 +1021,7 @@ liveSockets.on('connection', (client) => {
     };
     const generate = () => streamFinalTranslation(
       pcm, snapshot.original, snapshot.translation, finalController.signal, sendTranslation, takeAttempt,
+      progressDeadline,
     );
     try {
       if (snapshot.translation) {
@@ -1049,7 +1078,10 @@ liveSockets.on('connection', (client) => {
       }
       status = clientCancelled ? 499 : finalController.signal.aborted ? 504 : error.status || 500;
       if (clientCancelled) console.info('[다음 듣기로 전환]', { model, source, status });
-      else console.error('[최종 번역 오류]', { model, source, status });
+      else console.error(confirmedTranslation ? '[추천 답변 오류]' : '[최종 번역 오류]', {
+        model, source, status,
+        timeoutStage: error.timeoutStage || finalController.signal.reason?.timeoutStage || null,
+      });
       const errorMessage = {
         409: '마지막 발화 수신이 지연됐습니다. 문장을 다시 말해 주세요.',
         422: '음성을 인식하지 못했습니다.',
@@ -1068,6 +1100,8 @@ liveSockets.on('connection', (client) => {
       isTranslating = false;
       console.info('[최종 번역 응답]', {
         model, source, status, attempts, cacheHit,
+        translationReady: Boolean(confirmedTranslation) || status === 200,
+        suggestionsCompleted: status === 200,
         durationMs: Math.round(performance.now() - finishStartedAt),
       });
       end();
