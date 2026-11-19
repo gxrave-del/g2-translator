@@ -16,8 +16,17 @@ const MAX_AUDIO_SECONDS = 60;
 const MAX_AUDIO_BYTES = SAMPLE_RATE * 2 * MAX_AUDIO_SECONDS;
 const LIVE_CHUNK_BYTES = SAMPLE_RATE * 2 / 10;
 const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL?.trim() || 'gemini-3.5-live-translate-preview';
-const FINAL_MODEL = 'gemini-3.5-flash-lite';
-const FINAL_BACKUP_MODEL = 'gemini-3.1-flash-lite';
+const FINAL_MODEL_OPTIONS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const configuredFinalModel = process.env.GEMINI_FINAL_MODEL?.trim();
+const FINAL_MODEL = FINAL_MODEL_OPTIONS.includes(configuredFinalModel)
+  ? configuredFinalModel : FINAL_MODEL_OPTIONS[0];
+const FINAL_BACKUP_MODEL = FINAL_MODEL_OPTIONS.find((model) => model !== FINAL_MODEL);
+const AUDIO_FINAL_MODEL = FINAL_MODEL_OPTIONS[0];
+if (configuredFinalModel && configuredFinalModel !== FINAL_MODEL) {
+  console.warn('[최종 모델 설정 확인]', 'GEMINI_FINAL_MODEL은 3.5 또는 3.1 Flash-Lite만 지원합니다. 기본 모델을 사용합니다.');
+}
+// 위트 유무를 같은 모델에서 비교할 때만 3으로 설정합니다. 기본값은 기존 4개입니다.
+const REPLY_COUNT = process.env.G2_REPLY_COUNT?.trim() === '3' ? 3 : 4;
 const FINAL_CACHE_TTL_MS = 5 * 60_000;
 const FINAL_CACHE_MAX_ITEMS = 64;
 const finalCache = new Map();
@@ -61,19 +70,23 @@ function setFinalCache(original, translation, output) {
   while (finalCache.size > FINAL_CACHE_MAX_ITEMS) finalCache.delete(finalCache.keys().next().value);
 }
 
-function availableFinalModels() {
-  const models = [FINAL_MODEL, FINAL_BACKUP_MODEL];
+function availableFinalModels(preferredModel) {
+  const models = [preferredModel, ...FINAL_MODEL_OPTIONS.filter((model) => model !== preferredModel)];
   const available = models.filter((model) => (modelBusyUntil.get(model) || 0) <= Date.now());
   // 두 모델 모두 혼잡했으면 이번 요청에서는 더 오래 전에 실패한 모델만 확인합니다.
   return available.length ? available : [models.sort((a, b) => modelBusyUntil.get(a) - modelBusyUntil.get(b))[0]];
 }
 
-const REPLY_LABELS = ['긍정', '거절·대안', '역질문', '위트'];
+const REPLY_LABELS = ['긍정', '거절·대안', '역질문', '위트'].slice(0, REPLY_COUNT);
 const REPLY_INSTRUCTIONS = [
-  '상대에게 바로 말할 수 있는 답변을 4개 만드세요.',
-  '1번 긍정·수락, 2번 정중한 거절·대안, 3번 상황을 확인하는 역질문, 4번 가볍고 재치 있는 위트 순서입니다.',
+  `상대에게 바로 말할 수 있는 답변을 ${REPLY_COUNT}개 만드세요.`,
+  REPLY_COUNT === 4
+    ? '1번 긍정·수락, 2번 정중한 거절·대안, 3번 상황을 확인하는 역질문, 4번 가볍고 재치 있는 위트 순서입니다.'
+    : '1번 긍정·수락, 2번 정중한 거절·대안, 3번 상황을 확인하는 역질문 순서입니다.',
   'reply는 상대의 언어로 짧은 한 문장, pronunciation은 한글 발음, meaning은 한국어 뜻입니다.',
-  '답변은 가능하면 8단어 안팎으로 쓰고, 발음과 뜻은 그 문장에 해당하는 내용만 적으세요. 위트도 짧게 쓰세요.',
+  REPLY_COUNT === 4
+    ? '답변은 가능하면 8단어 안팎으로 쓰고, 발음과 뜻은 그 문장에 해당하는 내용만 적으세요. 위트도 짧게 쓰세요.'
+    : '답변은 가능하면 8단어 안팎으로 쓰고, 발음과 뜻은 그 문장에 해당하는 내용만 적으세요.',
   '숫자, 장소, 부정 표현을 보존하고 사실을 지어내지 마세요.',
 ];
 
@@ -155,7 +168,7 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
       ...(original ? {} : { original: { type: 'string' } }),
       ...(translation ? {} : { translation: { type: 'string' } }),
       suggestions: {
-        type: 'array', minItems: 4, maxItems: 4,
+        type: 'array', minItems: REPLY_COUNT, maxItems: REPLY_COUNT,
         items: {
           type: 'object',
           properties: {
@@ -170,19 +183,23 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
   };
   const ai = getFinalAI();
   let sentTranslation = false;
-  const models = availableFinalModels();
+  const preferredModel = original ? FINAL_MODEL : AUDIO_FINAL_MODEL;
+  const models = availableFinalModels(preferredModel);
   let model = models[0];
-  if (model !== FINAL_MODEL) console.info('[혼잡 모델 임시 우회]', { model });
+  if (model !== preferredModel) console.info('[혼잡 모델 임시 우회]', { model });
   async function generate() {
     takeAttempt();
     const controller = new AbortController();
     const requestSignal = AbortSignal.any([signal, controller.signal]);
     const startedAt = performance.now();
     let firstTokenMs = null;
+    let firstChunkChars = 0;
+    let thoughtsTokenCount = null;
     let iterator;
     let text = '';
     let completed = false;
     try {
+      console.info('[답변 요청 시작]', { model, replyCount: REPLY_COUNT, source: original ? 'text' : 'audio' });
       iterator = await beforeAbort(ai.models.generateContentStream({
         model, contents,
         config: {
@@ -197,7 +214,14 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
         const next = await beforeAbort(iterator.next(), requestSignal);
         if (next.done) break;
         const delta = next.value.text || '';
-        if (delta && firstTokenMs === null) firstTokenMs = Math.round(performance.now() - startedAt);
+        if (delta && firstTokenMs === null) {
+          firstTokenMs = Math.round(performance.now() - startedAt);
+          firstChunkChars = delta.length;
+          console.info('[답변 첫 응답]', { model, firstTokenMs, firstChunkChars });
+        }
+        if (Number.isFinite(next.value.usageMetadata?.thoughtsTokenCount)) {
+          thoughtsTokenCount = next.value.usageMetadata.thoughtsTokenCount;
+        }
         text += delta;
         if (text.length > 64_000) throw Object.assign(new Error('번역 결과가 너무 깁니다.'), { status: 502 });
         if (!sentTranslation && !translation) {
@@ -227,8 +251,9 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
       throw Object.assign(new Error('추천 답변 결과가 완성되지 않았습니다.'), { status: 502 });
     } finally {
       console.info('[답변 생성 시간]', {
-        model, firstTokenMs, durationMs: Math.round(performance.now() - startedAt),
-        outputChars: text.length, completed,
+        model, replyCount: REPLY_COUNT, firstTokenMs, firstChunkChars,
+        durationMs: Math.round(performance.now() - startedAt),
+        outputChars: text.length, thoughtsTokenCount, completed,
       });
       controller.abort();
       try { iterator?.return?.().catch(() => {}); } catch { /* 이미 종료된 스트림 */ }
@@ -544,7 +569,7 @@ app.post(
     isTranslating = true;
     const liveFinal = req.fromGlasses && req.query.mode === 'live';
     let model = liveFinal
-      ? FINAL_MODEL
+      ? AUDIO_FINAL_MODEL
       : process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite';
     const timeout = liveFinal ? 20_000 : req.fromGlasses ? 15_000 : 8_000;
     const signal = AbortSignal.timeout(timeout);
@@ -565,13 +590,7 @@ app.post(
       const { targetLang = 'ko' } = req.body ?? {};
       const language = targetLang === 'ko' ? '한국어' : '영어';
 
-      const replyInstructions = [
-        `상대에게 바로 말할 수 있는 답변을 ${REPLY_LABELS.length}개 만드세요.`,
-        'suggestions 배열에 1번 긍정·수락, 2번 정중한 거절·대안, 3번 상황을 확인하는 역질문, 4번 위트 순으로 적으세요.',
-        '답변은 각각 짧은 한 문장으로 쓰세요. 4번은 상황에 어울리는 가볍고 재치 있는 한마디로 쓰세요.',
-        '답변의 reply에는 상대의 언어로 쓴 문장, pronunciation에는 한글 발음, meaning에는 한국어 뜻을 적으세요.',
-        '상대가 말한 장소, 숫자, 부정 표현을 살리세요. 확인되지 않은 사실을 지어내지 마세요.',
-      ];
+      const replyInstructions = REPLY_INSTRUCTIONS;
       const contents = req.fromGlasses
         ? [{
             role: 'user',
@@ -639,8 +658,9 @@ app.post(
         const backupLimitError = reserveTranslation();
         if (backupLimitError) return res.status(429).json({ error: backupLimitError });
 
-        console.warn('[최종 번역 모델 전환]', { from: model, to: FINAL_BACKUP_MODEL, status: 503 });
-        model = FINAL_BACKUP_MODEL;
+        const backupModel = FINAL_MODEL_OPTIONS.find((candidate) => candidate !== model);
+        console.warn('[최종 번역 모델 전환]', { from: model, to: backupModel, status: 503 });
+        model = backupModel;
         response = await translate();
       }
 
@@ -708,7 +728,8 @@ function toWav(pcm) {
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter listening on port ${port}`);
   console.info('[최종 번역 모델]', FINAL_MODEL, '예비 모델', FINAL_BACKUP_MODEL);
-  console.info('[빠른 번역]', 'Gemini 전용 v5 · 완성 즉시 전달 · 60초 · 답변 4개');
+  console.info('[음성 재처리 모델]', AUDIO_FINAL_MODEL);
+  console.info('[빠른 번역]', `Gemini 전용 v6 · 모델 선택 지원 · 60초 · 답변 ${REPLY_COUNT}개`);
 });
 
 const liveSockets = new WebSocketServer({
