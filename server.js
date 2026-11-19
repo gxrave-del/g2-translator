@@ -77,7 +77,7 @@ async function beforeAbort(promise, signal) {
   }
 }
 
-async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation) {
+async function streamFinalTranslation(pcm, original, translation, signal, sendTranslation, takeAttempt) {
   const instructions = [
     translation
       ? '아래 발화 원문과 한국어 번역을 바탕으로 suggestions만 작성하세요.'
@@ -115,6 +115,7 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
   let sentTranslation = false;
   let model = FINAL_MODEL;
   async function generate() {
+    takeAttempt();
     const iterator = await beforeAbort(ai.models.generateContentStream({
       model, contents,
       config: {
@@ -149,8 +150,6 @@ async function streamFinalTranslation(pcm, original, translation, signal, sendTr
     error.model = model;
     if (error.status !== 503 || sentTranslation || signal.aborted) throw error;
     await delay(500, undefined, { signal });
-    const limitError = reserveTranslation();
-    if (limitError) throw Object.assign(new Error(limitError), { status: 429 });
     console.warn('[최종 번역 모델 전환]', { from: model, to: FINAL_BACKUP_MODEL, status: 503 });
     model = FINAL_BACKUP_MODEL;
     try {
@@ -617,7 +616,7 @@ function toWav(pcm) {
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`g2-interpreter listening on port ${port}`);
   console.info('[최종 번역 모델]', FINAL_MODEL, '예비 모델', FINAL_BACKUP_MODEL);
-  console.info('[빠른 번역]', '원문 재사용 수정 v2 · 60초 · 답변 4개');
+  console.info('[빠른 번역]', '연속 원문 처리 v3 · 60초 · 답변 4개');
 });
 
 const liveSockets = new WebSocketServer({
@@ -655,6 +654,9 @@ liveSockets.on('connection', (client) => {
   let inputConfirmedBytes = 0;
   let outputFinished = false;
   let outputConfirmedBytes = 0;
+  let lastInputAt = -Infinity;
+  let lastOutputAt = -Infinity;
+  let liveFailed = false;
   let drainCheckTimer;
   let finishStartedAt;
   let finalController;
@@ -688,11 +690,12 @@ liveSockets.on('connection', (client) => {
   }
 
   function onLiveMessage({ serverContent }) {
-    if (!['captions', 'draining'].includes(phase) || !serverContent) return;
+    if (!['captions', 'draining', 'finalizing'].includes(phase) || !serverContent) return;
     const input = serverContent.inputTranscription;
     const preview = serverContent.interimInputTranscription;
     const output = serverContent.outputTranscription;
     if (input) {
+      if (input.text) lastInputAt = performance.now();
       original += (input.text ?? '') + (input.finished ? ' ' : '');
       if (original.length > 12_000) {
         transcriptOverflow = true;
@@ -706,9 +709,11 @@ liveSockets.on('connection', (client) => {
     }
     if (typeof preview?.text === 'string') {
       interim = preview.text;
+      lastInputAt = performance.now();
       if (interim.trim()) inputFinished = false;
     }
     if (output) {
+      if (output.text) lastOutputAt = performance.now();
       translation += (output.text ?? '') + (output.finished ? ' ' : '');
       if (translation.length > 12_000) {
         translationOverflow = true;
@@ -719,42 +724,51 @@ liveSockets.on('connection', (client) => {
       }
       if (output.finished === true) outputConfirmedBytes = pcmBytes;
     }
-    if ((input || preview || output) && !captionTimer) {
+    if (phase !== 'finalizing' && (input || preview || output) && !captionTimer) {
       captionTimer = setTimeout(sendCaption, 250);
     }
     if (phase === 'draining' && (input || preview || output)) scheduleFinalCheck();
   }
 
-  function hasFinalOriginal() {
-    return inputFinished && inputConfirmedBytes === pcmBytes && !interim.trim() &&
-      !transcriptOverflow && original.trim().length > 0;
+  function hasUsableOriginal() {
+    return !liveFailed && !interim.trim() && !transcriptOverflow && original.trim().length > 0;
+  }
+
+  function readStableSource() {
+    const now = performance.now();
+    if (!hasUsableOriginal() || now - lastInputAt < 400) {
+      return { original: '', translation: '' };
+    }
+    const reusableTranslation = !translationOverflow && lastOutputAt >= lastInputAt && now - lastOutputAt >= 400;
+    return {
+      original: original.trim(),
+      translation: reusableTranslation ? translation.trim() : '',
+    };
   }
 
   function scheduleFinalCheck() {
     clearTimeout(drainCheckTimer);
-    if (phase !== 'draining' || !hasFinalOriginal()) return;
-    // 마지막 단어가 늦게 도착할 여유를 두고, 원문이 완성되면 전체 대기를 끝냅니다.
-    const quietWait = Math.max(250, 800 - (performance.now() - finishStartedAt));
+    if (phase !== 'draining' || !hasUsableOriginal()) return;
+    // 연속 번역에는 finished 필드가 생략될 수 있습니다. 종료 뒤 텍스트 안정 시간을 확인합니다.
+    const now = performance.now();
+    const quietWait = Math.max(
+      0,
+      400 - (now - lastInputAt),
+      400 - (now - lastOutputAt),
+      1_000 - (now - finishStartedAt),
+    );
     drainCheckTimer = setTimeout(() => void finishTranslation(), quietWait);
   }
 
   async function finishTranslation() {
     if (phase !== 'draining') return;
-    const reuseTranscript = hasFinalOriginal();
-    const finalOriginal = reuseTranscript ? original.trim() : '';
-    const finalTranslation = reuseTranscript && outputFinished && outputConfirmedBytes === pcmBytes && !translationOverflow
-      ? translation.trim() : '';
+    let snapshot = readStableSource();
     const pcm = Buffer.concat(audioParts, pcmBytes);
     audioParts = [];
     phase = 'finalizing';
     clearTimeout(deadline);
     clearTimeout(captionTimer);
     clearTimeout(drainCheckTimer);
-    liveSession?.close();
-    if (ownsSlot) {
-      liveInUse = false;
-      ownsSlot = false;
-    }
     if (isTranslating) return end(429, '이전 번역 요청이 처리 중입니다.');
     const limitError = reserveTranslation();
     if (limitError) return end(429, limitError);
@@ -762,35 +776,75 @@ liveSockets.on('connection', (client) => {
     isTranslating = true;
     finalController = new AbortController();
     deadline = setTimeout(() => finalController.abort(), 20_000);
-    const source = finalTranslation ? 'live' : reuseTranscript ? 'text' : 'audio';
+    let source = snapshot.translation ? 'live' : snapshot.original ? 'text' : 'audio';
     console.info('[최종 번역 시작]', {
       source, audioSeconds: pcmBytes / (SAMPLE_RATE * 2),
       transcriptChars: original.trim().length,
       inputFinished, audioAfterInputEndBytes: pcmBytes - inputConfirmedBytes,
       outputFinished, audioAfterOutputEndBytes: pcmBytes - outputConfirmedBytes,
       interimChars: interim.trim().length,
-      transcriptOverflow, translationOverflow,
+      translationChars: translation.trim().length,
+      transcriptAgeMs: Number.isFinite(lastInputAt) ? Math.round(performance.now() - lastInputAt) : null,
+      transcriptOverflow, translationOverflow, liveFailed,
     });
     let status = 200;
     let model = FINAL_MODEL;
+    let attempts = 0;
+    const takeAttempt = () => {
+      if (attempts >= 2) {
+        throw Object.assign(new Error('마지막 발화가 계속 갱신되고 있습니다.'), { status: 409 });
+      }
+      if (attempts > 0) {
+        const error = reserveTranslation();
+        if (error) throw Object.assign(new Error(error), { status: 429 });
+      }
+      attempts++;
+    };
     client.send(JSON.stringify({ type: 'finalizing', source }));
     const sendTranslation = (partial, usedModel) => {
       if (client.readyState !== WebSocket.OPEN) return;
+      if (source !== 'audio' && (liveFailed || interim.trim() || snapshot.original !== original.trim())) return;
       model = usedModel;
       client.send(JSON.stringify({ type: 'translation', ...partial }));
       console.info('[번역 우선 표시]', {
         model, source, durationMs: Math.round(performance.now() - finishStartedAt),
       });
     };
+    const generate = () => streamFinalTranslation(
+      pcm, snapshot.original, snapshot.translation, finalController.signal, sendTranslation, takeAttempt,
+    );
     try {
-      if (finalTranslation) {
-        sendTranslation({ original: finalOriginal, translation: finalTranslation }, model);
+      if (snapshot.translation) {
+        sendTranslation(snapshot, model);
       }
-      const output = await streamFinalTranslation(
-        pcm, finalOriginal, finalTranslation, finalController.signal, sendTranslation,
-      );
+      let output = await generate();
       model = output.model;
       if (phase === 'closed') return;
+
+      // 생성 중에도 Live 입력을 받아 뒤늦게 온 말끝을 버리지 않습니다.
+      if (snapshot.original && (liveFailed || interim.trim() || snapshot.original !== original.trim())) {
+        if (attempts >= 2) {
+          throw Object.assign(new Error('마지막 발화가 계속 갱신되고 있습니다.'), { status: 409 });
+        }
+        await delay(400, undefined, { signal: finalController.signal });
+        snapshot = readStableSource();
+        source = snapshot.translation ? 'live' : snapshot.original ? 'text' : 'audio';
+        console.info('[마지막 발화 반영]', { source, transcriptChars: snapshot.original.length });
+        if (snapshot.translation) sendTranslation(snapshot, model);
+        output = await generate();
+        model = output.model;
+        if (phase === 'closed') return;
+        if (snapshot.original && (liveFailed || interim.trim() || snapshot.original !== original.trim())) {
+          throw Object.assign(new Error('마지막 발화가 계속 갱신되고 있습니다.'), { status: 409 });
+        }
+      }
+      if (snapshot.translation) {
+        const latest = readStableSource();
+        if (latest.original === snapshot.original && latest.translation && latest.translation !== output.result.translation) {
+          output.result = makeFinalResult({ ...output.result, translation: latest.translation }, latest.original);
+          sendTranslation(latest, model);
+        }
+      }
       latestText = output.result.text;
       client.send(JSON.stringify({ type: 'result', ...output.result }));
     } catch (error) {
@@ -798,6 +852,7 @@ liveSockets.on('connection', (client) => {
       status = finalController.signal.aborted ? 504 : error.status || 500;
       console.error('[최종 번역 오류]', { model, source, status });
       const errorMessage = {
+        409: '마지막 발화 수신이 지연됐습니다. 문장을 다시 말해 주세요.',
         422: '음성을 인식하지 못했습니다.',
         429: '번역 요청 한도에 도달했습니다.',
         503: '번역 서비스가 잠시 혼잡합니다.',
@@ -830,14 +885,18 @@ liveSockets.on('connection', (client) => {
         callbacks: {
           onmessage: onLiveMessage,
           onerror: () => {
-            if (phase === 'finalizing' || phase === 'closed') return;
+            if (phase === 'closed') return;
+            liveFailed = true;
+            if (phase === 'finalizing') return;
             if (phase === 'draining') {
               inputFinished = false;
               void finishTranslation();
             } else end(502, '실시간 번역 연결 오류');
           },
           onclose: ({ code }) => {
-            if (['closed', 'finalizing'].includes(phase)) return;
+            if (phase === 'closed') return;
+            liveFailed = true;
+            if (phase === 'finalizing') return;
             if (phase === 'draining') {
               inputFinished = false;
               void finishTranslation();
@@ -911,6 +970,7 @@ liveSockets.on('connection', (client) => {
       try {
         liveSession.sendRealtimeInput({ audioStreamEnd: true });
       } catch {
+        liveFailed = true;
         void finishTranslation();
       }
       return;
